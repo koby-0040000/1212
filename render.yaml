@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: sionyx-remote
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: DASHBOARD_PASSWORD
+        sync: false          # you type it in the Render dashboard
+      - key: AGENT_KEY
+        generateValue: true  # Render creates a random key; copy it from Environment

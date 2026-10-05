@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIONYX - דשבורד מחשבים</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --text:#1c1f24; --muted:#6b7280; --line:#e2e5ea; --ok:#16a34a; --off:#9ca3af; --busy:#d97706; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --card:#1e2127; --text:#e8eaed; --muted:#9aa0a6; --line:#2e333b; --accent:#5b8def; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, "Segoe UI", Arial, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:16px 20px; border-bottom:1px solid var(--line); background:var(--card); }
+  h1 { font-size:18px; margin:0; }
+  .stats { color:var(--muted); font-size:14px; }
+  .stats b { color:var(--text); }
+  .tools { display:flex; gap:8px; align-items:center; }
+  input[type=text], input[type=password] { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); font-size:14px; }
+  button { padding:8px 14px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--text); cursor:pointer; font-size:14px; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  main { padding:20px; display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:8px; }
+  .top { display:flex; justify-content:space-between; align-items:center; }
+  .num { font-size:20px; font-weight:700; }
+  .badge { font-size:12px; padding:3px 9px; border-radius:999px; color:#fff; background:var(--off); }
+  .badge.online { background:var(--ok); } .badge.busy { background:var(--busy); }
+  .sub { color:var(--muted); font-size:13px; min-height:18px; }
+  .row { display:flex; gap:6px; }
+  .row button { flex:1; }
+  .small { padding:5px 8px; font-size:12px; flex:0 0 auto; }
+  .empty, .msg { grid-column:1/-1; text-align:center; color:var(--muted); padding:40px 0; }
+  #login { max-width:320px; margin:12vh auto; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px; display:flex; flex-direction:column; gap:12px; }
+  #login .err { color:#dc2626; font-size:13px; min-height:16px; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+
+<div id="login" class="hidden">
+  <h1>כניסה לדשבורד</h1>
+  <input id="pw" type="password" placeholder="סיסמה" autocomplete="current-password">
+  <button class="primary" id="loginBtn">כניסה</button>
+  <div class="err" id="loginErr"></div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <div>
+      <h1>מחשבים מרוחקים</h1>
+      <div class="stats">פעילים: <b id="sOnline">0</b> מתוך <b id="sTotal">0</b></div>
+    </div>
+    <div class="tools">
+      <input id="q" type="text" placeholder="חיפוש מספר / שם">
+      <button id="logout">יציאה</button>
+    </div>
+  </header>
+  <main id="grid"></main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let data = [], timer = null;
+
+async function api(path, opts = {}) {
+  const res = await fetch('/api' + path, {
+    method: opts.method || 'GET',
+    headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    credentials: 'same-origin',
+  });
+  let json = {}; try { json = await res.json(); } catch {}
+  if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  if (!res.ok) throw Object.assign(new Error(json.error || res.statusText), { status: res.status });
+  return json;
+}
+
+function showLogin() { clearInterval(timer); $('app').classList.add('hidden'); $('login').classList.remove('hidden'); $('pw').focus(); }
+function showApp() { $('login').classList.add('hidden'); $('app').classList.remove('hidden'); refresh(); clearInterval(timer); timer = setInterval(refresh, 5000); }
+
+function ago(ms) {
+  if (!ms) return 'אף פעם';
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return `לפני ${s} שנ׳`;
+  if (s < 3600) return `לפני ${Math.round(s / 60)} דק׳`;
+  if (s < 86400) return `לפני ${Math.round(s / 3600)} שע׳`;
+  return `לפני ${Math.round(s / 86400)} ימים`;
+}
+
+function render() {
+  const q = $('q').value.trim().toLowerCase();
+  const list = data
+    .filter((c) => !q || c.number.toLowerCase().includes(q) || c.name.toLowerCase().includes(q) || c.hostname.toLowerCase().includes(q))
+    .sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true }));
+  const grid = $('grid'); grid.textContent = '';
+  if (!list.length) {
+    const d = document.createElement('div'); d.className = 'empty';
+    d.textContent = data.length ? 'לא נמצאו תוצאות' : 'עדיין אין מחשבים רשומים. התקן את הסוכן על מחשב והוא יופיע כאן.';
+    grid.appendChild(d); return;
+  }
+  for (const c of list) {
+    const card = document.createElement('div'); card.className = 'card';
+    const top = document.createElement('div'); top.className = 'top';
+    const num = document.createElement('span'); num.className = 'num'; num.textContent = 'מחשב ' + c.number;
+    const badge = document.createElement('span');
+    badge.className = 'badge' + (c.busy ? ' busy' : c.online ? ' online' : '');
+    badge.textContent = c.busy ? 'בשליטה' : c.online ? 'פעיל' : 'כבוי';
+    top.append(num, badge);
+    const sub = document.createElement('div'); sub.className = 'sub';
+    sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
+    const seen = document.createElement('div'); seen.className = 'sub';
+    seen.textContent = 'נראה לאחרונה: ' + (c.online ? 'עכשיו' : ago(c.lastSeen));
+    const row = document.createElement('div'); row.className = 'row';
+    const go = document.createElement('button'); go.className = 'primary'; go.textContent = 'התחבר'; go.disabled = !c.online;
+    go.onclick = () => connect(c, go);
+    const ren = document.createElement('button'); ren.className = 'small'; ren.textContent = 'שם'; ren.title = 'שינוי שם';
+    ren.onclick = () => rename(c);
+    row.append(go, ren);
+    if (!c.online) {
+      const del = document.createElement('button'); del.className = 'small'; del.textContent = 'הסר'; del.title = 'הסר מהרשימה';
+      del.onclick = () => forget(c);
+      row.append(del);
+    }
+    card.append(top, sub, seen, row);
+    grid.appendChild(card);
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await api('/computers');
+    data = r.computers;
+    $('sOnline').textContent = r.online; $('sTotal').textContent = r.total;
+    render();
+  } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
+}
+
+async function connect(c, btn) {
+  const w = window.open('', '_blank'); // opened synchronously so popup blockers allow it
+  btn.disabled = true; btn.textContent = 'מתחבר...';
+  try {
+    const r = await api(`/computers/${encodeURIComponent(c.number)}/connect`, { method: 'POST' });
+    if (w) w.location = r.url; else location.href = r.url;
+  } catch (e) {
+    if (w) w.close();
+    alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message);
+  }
+  setTimeout(() => { btn.textContent = 'התחבר'; refresh(); }, 3000);
+}
+
+async function rename(c) {
+  const name = prompt('שם למחשב ' + c.number, c.name || '');
+  if (name === null) return;
+  await api(`/computers/${encodeURIComponent(c.number)}/name`, { method: 'POST', body: { name } });
+  refresh();
+}
+
+async function forget(c) {
+  if (!confirm(`להסיר את מחשב ${c.number} מהרשימה? הוא יופיע שוב כשיידלק.`)) return;
+  await api(`/computers/${encodeURIComponent(c.number)}`, { method: 'DELETE' });
+  refresh();
+}
+
+$('q').addEventListener('input', render);
+$('logout').onclick = async () => { await api('/logout', { method: 'POST' }).catch(() => {}); showLogin(); };
+async function doLogin() {
+  $('loginErr').textContent = '';
+  try { await api('/login', { method: 'POST', body: { password: $('pw').value } }); $('pw').value = ''; showApp(); }
+  catch (e) { $('loginErr').textContent = e.status === 429 ? 'יותר מדי ניסיונות, נסה מאוחר יותר' : e.status === 503 ? 'השרת לא הוגדר (חסר DASHBOARD_PASSWORD)' : 'סיסמה שגויה'; }
+}
+$('loginBtn').onclick = doLogin;
+$('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+
+api('/computers').then(showApp).catch(() => {});
+</script>
+</body>
+</html>
