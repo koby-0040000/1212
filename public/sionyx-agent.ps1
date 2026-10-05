@@ -3,7 +3,8 @@
 #  - When the admin presses "connect", receives a one-time token and bridges the
 #    local TightVNC (127.0.0.1:5900) to the relay over HTTPS (NetFree-friendly).
 #
-# Install (PowerShell as Administrator, number is the computer number you choose):
+# Normal install: download the installer from the dashboard (button) and double-click it.
+# Manual install (PowerShell as Administrator):
 #   .\sionyx-agent.ps1 -ComputerNumber 12 -Key "<AGENT_KEY>" -Server "https://<name>.onrender.com" -Install
 # Remove:  Unregister-ScheduledTask -TaskName SionyxAgent -Confirm:$false
 param(
@@ -23,12 +24,12 @@ if ($Install) {
   if (-not $admin) { Write-Host 'Run this PowerShell window as Administrator.' -ForegroundColor Red; exit 1 }
   New-Item -ItemType Directory -Force -Path $Dir | Out-Null
   $target = Join-Path $Dir 'agent.ps1'
-  Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force
+  if ($PSCommandPath -ne $target) { Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force }
   $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$target`" -ComputerNumber `"$ComputerNumber`" -Key `"$Key`" -Server `"$Server`""
   $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
   $trigger = New-ScheduledTaskTrigger -AtStartup
   $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-  $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+  $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
   Register-ScheduledTask -TaskName 'SionyxAgent' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
   Start-ScheduledTask -TaskName 'SionyxAgent'
   Write-Host "Installed. Computer $ComputerNumber will appear in the dashboard within ~10 seconds." -ForegroundColor Green
@@ -48,9 +49,92 @@ function Log($m) {
   } catch { }
 }
 
+try {
+  Add-Type -Namespace Sx -Name Native -MemberDefinition @'
+[DllImport("sas.dll")] public static extern void SendSAS(bool asUser);
+[DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();
+'@
+} catch { }
+
+# Fixed whitelist only - the agent never runs arbitrary commands from the server.
+function Run-Command([string]$cmd) {
+  Log "command: $cmd"
+  try {
+    $none = [uint32]::MaxValue
+    switch ($cmd) {
+      'cad'      { [Sx.Native]::SendSAS($false) }
+      'lock'     { $id = [Sx.Native]::WTSGetActiveConsoleSessionId(); if ($id -ne $none) { & tsdiscon.exe $id } }
+      'logoff'   { $id = [Sx.Native]::WTSGetActiveConsoleSessionId(); if ($id -ne $none) { & logoff.exe $id } }
+      'restart'  { & shutdown.exe /r /t 5 /f }
+      'shutdown' { & shutdown.exe /s /t 5 /f }
+      default    { Log "unknown command ignored: $cmd" }
+    }
+  } catch { Log "command failed: $($_.Exception.Message)" }
+}
+
+function Handle-Reply($r) {
+  if ($r -and $r.commands) { foreach ($c in @($r.commands)) { Run-Command ([string]$c) } }
+}
+
+# Control channel used by the viewer's Ctrl+Alt+Del button (same JSON protocol as the kiosk app).
+function Poll-Control([string]$Token) {
+  try {
+    $r = Invoke-RestMethod -Method Get -Uri "$Server/rt/controlAgent/$Token/recv?wait=0" -UseBasicParsing -TimeoutSec 15
+    foreach ($m in $r.messages) {
+      $o = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($m.data)) | ConvertFrom-Json
+      if ($o.type -eq 'ctrlaltdel') { Run-Command 'cad' } else { Log "control message not supported by this agent: $($o.type)" }
+    }
+  } catch { }
+}
+
+function Test-Vnc {
+  try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $iar = $c.BeginConnect('127.0.0.1', 5900, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne(500) -and $c.Connected
+    $c.Close()
+    return [bool]$ok
+  } catch { return $false }
+}
+
+function Get-Stats {
+  $s = @{ agent = '2'; vnc = (Test-Vnc) }
+  try {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $s.os = [string]$os.Caption
+    $s.uptimeHours = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 1)
+    $s.ramTotalGb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+    $s.ramFreeGb = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+  } catch { }
+  try {
+    $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+    $s.cpuPct = [int]$cpu
+  } catch { }
+  try {
+    $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+    $s.diskTotalGb = [math]::Round($d.Size / 1GB)
+    $s.diskFreeGb = [math]::Round($d.FreeSpace / 1GB)
+  } catch { }
+  try { $s.user = [string](Get-CimInstance Win32_ComputerSystem).UserName } catch { }
+  try {
+    $ip = [Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | Where-Object { $_.AddressFamily -eq 'InterNetwork' -and -not $_.ToString().StartsWith('169.254') } | Select-Object -First 1
+    if ($ip) { $s.ip = $ip.ToString() }
+  } catch { }
+  return $s
+}
+
+$script:Stats = $null
+$script:StatsAt = [datetime]::MinValue
+function Refresh-Stats {
+  if (((Get-Date) - $script:StatsAt).TotalSeconds -ge 30) {
+    $script:Stats = Get-Stats
+    $script:StatsAt = Get-Date
+  }
+}
+
 function Beat([bool]$busy) {
   try {
-    $body = @{ number = $ComputerNumber; hostname = $env:COMPUTERNAME; busy = $busy } | ConvertTo-Json -Compress
+    $body = @{ number = $ComputerNumber; hostname = $env:COMPUTERNAME; busy = $busy; stats = $script:Stats } | ConvertTo-Json -Compress -Depth 3
     return Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
   } catch { return $null }
 }
@@ -64,7 +148,7 @@ function Run-Session([string]$Token) {
     $stream = $tcp.GetStream()
     $buf = New-Object byte[] 16384
     $tx = 0; $rx = 0
-    $started = Get-Date; $lastBeat = Get-Date; $lastPoll = [Diagnostics.Stopwatch]::StartNew()
+    $started = Get-Date; $lastBeat = Get-Date; $lastPoll = [Diagnostics.Stopwatch]::StartNew(); $lastCtl = Get-Date
     while ($true) {
       if (-not $tcp.Connected) { Log 'TightVNC closed the connection'; break }
       while ($stream.DataAvailable) {
@@ -96,7 +180,8 @@ function Run-Session([string]$Token) {
           if ($r.closed) { Log 'viewer disconnected'; break }
         } catch { }
       }
-      if (((Get-Date) - $lastBeat).TotalSeconds -ge 10) { [void](Beat $true); $lastBeat = Get-Date }
+      if (((Get-Date) - $lastCtl).TotalMilliseconds -ge 500) { Poll-Control $Token; $lastCtl = Get-Date }
+      if (((Get-Date) - $lastBeat).TotalSeconds -ge 4) { Handle-Reply (Beat $true); $lastBeat = Get-Date }
       if ($rx -eq 0 -and ((Get-Date) - $started).TotalSeconds -gt 120) { Log 'viewer never joined, giving up'; break }
       if (((Get-Date) - $started).TotalHours -gt 6) { Log 'max session length reached'; break }
       Start-Sleep -Milliseconds 10
@@ -106,13 +191,16 @@ function Run-Session([string]$Token) {
   } finally {
     if ($tcp) { $tcp.Close() }
     try { Invoke-RestMethod -Method Post -Uri "$Base/close" -UseBasicParsing -TimeoutSec 10 | Out-Null } catch { }
+    try { Invoke-RestMethod -Method Post -Uri "$Server/rt/controlAgent/$Token/close" -UseBasicParsing -TimeoutSec 10 | Out-Null } catch { }
     Log 'session end'
   }
 }
 
 Log "agent started: computer $ComputerNumber -> $Server"
 while ($true) {
+  Refresh-Stats
   $r = Beat $false
+  Handle-Reply $r
   if ($r -and $r.session) { Run-Session ([string]$r.session) }
   Start-Sleep -Seconds 5
 }

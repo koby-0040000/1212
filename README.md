@@ -84,17 +84,30 @@ Two addresses once deployed on Render:
 
 ### Installing the agent on a computer
 
-TightVNC must already be running on `127.0.0.1:5900`. In PowerShell **as Administrator**:
+1. Open `/dashboard`, press **Download installer** (`sionyx-install.cmd`; the server URL and
+   agent key are already inside it).
+2. Copy it to the computer and double-click. Accept the Windows admin prompt, type the
+   computer number, done. It installs a startup task and the computer shows up in the dashboard.
 
-```
-iwr https://<name>.onrender.com/sionyx-agent.ps1 -OutFile sionyx-agent.ps1
-.\sionyx-agent.ps1 -ComputerNumber 12 -Key "<AGENT_KEY>" -Server "https://<name>.onrender.com" -Install
-```
+Re-running the installer updates the agent. TightVNC must be running on `127.0.0.1:5900`
+for remote control (the dashboard shows "VNC: ready / not available" per computer).
 
-`-ComputerNumber` is the number you choose (letters, digits, `-`, `_`; up to 32 chars).
-This registers a startup task that sends a heartbeat every 5 seconds. A computer with
-no heartbeat for ~25 seconds shows as off. Log: `C:\ProgramData\SionyxAgent\agent.log`.
+Each card shows a status report: logged-in user, CPU, RAM, disk C:, uptime, IP, VNC.
+A computer with no heartbeat for ~25 seconds shows as off. Agent log:
+`C:\ProgramData\SionyxAgent\agent.log`. Remove:
+`Unregister-ScheduledTask -TaskName SionyxAgent -Confirm:$false`.
 
 How Connect works: the dashboard creates a one-time token, the agent receives it in its
 next heartbeat response (within ~5s), bridges TightVNC to `/rt/agent/<token>`, and the
 viewer page joins the same room. Nothing else in the relay changed.
+
+### Commands and background operation
+
+- The agent runs as a SYSTEM scheduled task at startup, so it works with nobody logged in and
+  survives logout. The installer also sets TightVNC's service (`tvnserver`) to start automatically.
+- Dashboard dropdown per computer: Ctrl+Alt+Del, lock, log off user, restart, shutdown. Only this
+  fixed list is accepted - the agent never runs arbitrary commands. A queued command expires after 60s.
+- The viewer's existing **Ctrl+Alt+Del** button also works with this agent (control channel).
+  The viewer's "elevated click" and "type text" buttons are not implemented by this agent.
+- Ctrl+Alt+Del uses Windows `SendSAS`; the installer enables the required policy
+  (`SoftwareSASGeneration=1`).

@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const { buildInstaller } = require('./installer');
 
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
 const AGENT_KEY = process.env.AGENT_KEY || '';
@@ -29,6 +30,8 @@ const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
+const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown']);
+const COMMAND_TTL_MS = 60 * 1000; // a queued command the agent does not pick up in time is dropped
 const NUMBER_RE = /^[A-Za-z0-9_-]{1,32}$/;
 
 const computers = new Map(); // number -> { number, name, hostname, firstSeen, lastSeen, busy, pending }
@@ -97,11 +100,24 @@ function loginFailed(ip) {
   else a.n += 1;
 }
 
+function cleanStats(s) {
+  if (!s || typeof s !== 'object') return null;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
+  return {
+    os: str(s.os, 80), user: str(s.user, 80), ip: str(s.ip, 45), agent: str(s.agent, 10),
+    cpuPct: num(s.cpuPct), ramTotalGb: num(s.ramTotalGb), ramFreeGb: num(s.ramFreeGb),
+    diskTotalGb: num(s.diskTotalGb), diskFreeGb: num(s.diskFreeGb), uptimeHours: num(s.uptimeHours),
+    vnc: !!s.vnc,
+  };
+}
+
 const isOnline = (c) => !!c.lastSeen && Date.now() - c.lastSeen < ONLINE_MS;
 const view = (c) => ({
   number: c.number, name: c.name || '', hostname: c.hostname || '',
   online: isOnline(c), busy: isOnline(c) && !!c.busy,
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
+  stats: c.stats || null,
 });
 
 // ---- routes ----
@@ -148,6 +164,18 @@ router.post('/computers/:number/connect', requireAuth, (req, res) => {
   res.json({ url });
 });
 
+router.post('/computers/:number/command', requireAuth, (req, res) => {
+  const c = computers.get(req.params.number);
+  if (!c) return res.status(404).json({ error: 'unknown computer' });
+  if (!isOnline(c)) return res.status(409).json({ error: 'offline' });
+  const action = String((req.body && req.body.action) || '');
+  if (!COMMANDS.has(action)) return res.status(400).json({ error: 'unknown action' });
+  c.commands = (c.commands || []).slice(-4);
+  c.commands.push({ action, at: Date.now() });
+  console.log(`[dash] command ${action} queued for computer ${c.number}`);
+  res.json({ ok: true });
+});
+
 router.post('/computers/:number/name', requireAuth, (req, res) => {
   const c = computers.get(req.params.number);
   if (!c) return res.status(404).json({ error: 'unknown computer' });
@@ -162,6 +190,15 @@ router.delete('/computers/:number', requireAuth, (req, res) => {
   computers.delete(req.params.number);
   scheduleSave();
   res.json({ ok: true });
+});
+
+// One-click installer for Windows, with this server's URL and the agent key baked in.
+router.get('/installer', requireAuth, (req, res) => {
+  if (!AGENT_KEY) return res.status(503).json({ error: 'AGENT_KEY is not set on the server' });
+  const server = process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+  res.set('Content-Type', 'application/octet-stream');
+  res.set('Content-Disposition', 'attachment; filename="sionyx-install.cmd"');
+  res.send(buildInstaller({ server: server.replace(/\/$/, ''), key: AGENT_KEY }));
 });
 
 // Agent heartbeat. Response carries a session token when the admin pressed "connect".
@@ -182,14 +219,19 @@ router.post('/agent/heartbeat', (req, res) => {
   c.hostname = String(body.hostname || '').slice(0, 64);
   c.lastSeen = now;
   c.busy = !!body.busy;
+  const st = cleanStats(body.stats);
+  if (st) c.stats = st;
 
   let session = null;
   if (c.pending) {
     if (now - c.pending.createdAt >= PENDING_TTL_MS) c.pending = null;
     else if (!c.busy) { session = c.pending.token; c.pending = null; }
   }
+  const now2 = Date.now();
+  const commands = (c.commands || []).filter((x) => now2 - x.at < COMMAND_TTL_MS).map((x) => x.action);
+  c.commands = [];
   scheduleSave();
-  res.json({ session });
+  res.json({ session, commands });
 });
 
 module.exports = function mount(app) {

@@ -31,6 +31,9 @@
   .empty, .msg { grid-column:1/-1; text-align:center; color:var(--muted); padding:40px 0; }
   #login { max-width:320px; margin:12vh auto; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px; display:flex; flex-direction:column; gap:12px; }
   #login .err { color:#dc2626; font-size:13px; min-height:16px; }
+  .stat { font-size:13px; color:var(--text); line-height:1.5; }
+  .stat.warn { color:var(--busy); }
+  a { text-decoration:none; }
   .hidden { display:none !important; }
 </style>
 </head>
@@ -51,6 +54,7 @@
     </div>
     <div class="tools">
       <input id="q" type="text" placeholder="חיפוש מספר / שם">
+      <a href="/api/installer" download><button class="primary" type="button">הורד מתקין</button></a>
       <button id="logout">יציאה</button>
     </div>
   </header>
@@ -94,7 +98,7 @@ function render() {
   const grid = $('grid'); grid.textContent = '';
   if (!list.length) {
     const d = document.createElement('div'); d.className = 'empty';
-    d.textContent = data.length ? 'לא נמצאו תוצאות' : 'עדיין אין מחשבים רשומים. התקן את הסוכן על מחשב והוא יופיע כאן.';
+    d.textContent = data.length ? 'לא נמצאו תוצאות' : 'עדיין אין מחשבים רשומים. לחץ "הורד מתקין", הרץ אותו על המחשב (לחיצה כפולה), והוא יופיע כאן.';
     grid.appendChild(d); return;
   }
   for (const c of list) {
@@ -109,18 +113,36 @@ function render() {
     sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
     const seen = document.createElement('div'); seen.className = 'sub';
     seen.textContent = 'נראה לאחרונה: ' + (c.online ? 'עכשיו' : ago(c.lastSeen));
+    const info = document.createElement('div');
+    if (c.online && c.stats) {
+      const st = c.stats, add = (t, warn) => { const d = document.createElement('div'); d.className = 'stat' + (warn ? ' warn' : ''); d.textContent = t; info.appendChild(d); };
+      if (st.user) add('משתמש: ' + st.user.split('\\').pop());
+      const bits = [];
+      if (st.cpuPct != null) bits.push('מעבד ' + st.cpuPct + '%');
+      if (st.ramTotalGb != null && st.ramFreeGb != null) bits.push('זיכרון ' + (st.ramTotalGb - st.ramFreeGb).toFixed(1) + '/' + st.ramTotalGb + ' GB');
+      if (bits.length) add(bits.join(' · '));
+      if (st.diskTotalGb != null) add('דיסק C: ' + st.diskFreeGb + ' מתוך ' + st.diskTotalGb + ' GB פנוי');
+      if (st.uptimeHours != null) add('דלוק כבר ' + (st.uptimeHours < 1 ? Math.round(st.uptimeHours * 60) + ' דק׳' : st.uptimeHours + ' שע׳'));
+      if (st.ip) add('IP: ' + st.ip);
+      add(st.vnc ? 'VNC: מוכן' : 'VNC: לא זמין - שליטה לא תעבוד', !st.vnc);
+    }
     const row = document.createElement('div'); row.className = 'row';
     const go = document.createElement('button'); go.className = 'primary'; go.textContent = 'התחבר'; go.disabled = !c.online;
     go.onclick = () => connect(c, go);
     const ren = document.createElement('button'); ren.className = 'small'; ren.textContent = 'שם'; ren.title = 'שינוי שם';
     ren.onclick = () => rename(c);
-    row.append(go, ren);
+    const cmd = document.createElement('select'); cmd.className = 'small'; cmd.disabled = !c.online; cmd.title = 'שלח פקודה למחשב';
+    for (const [v, t] of [['', 'פקודה...'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['restart', 'אתחול'], ['shutdown', 'כיבוי']]) {
+      const o = document.createElement('option'); o.value = v; o.textContent = t; cmd.appendChild(o);
+    }
+    cmd.onchange = () => { const v = cmd.value; cmd.value = ''; cmd.blur(); sendCommand(c, v); };
+    row.append(go, ren, cmd);
     if (!c.online) {
       const del = document.createElement('button'); del.className = 'small'; del.textContent = 'הסר'; del.title = 'הסר מהרשימה';
       del.onclick = () => forget(c);
       row.append(del);
     }
-    card.append(top, sub, seen, row);
+    card.append(top, sub, seen, info, row);
     grid.appendChild(card);
   }
 }
@@ -129,6 +151,7 @@ async function refresh() {
   try {
     const r = await api('/computers');
     data = r.computers;
+    if (document.activeElement && document.activeElement.tagName === 'SELECT') { $('sOnline').textContent = r.online; $('sTotal').textContent = r.total; return; }
     $('sOnline').textContent = r.online; $('sTotal').textContent = r.total;
     render();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
@@ -145,6 +168,16 @@ async function connect(c, btn) {
     alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message);
   }
   setTimeout(() => { btn.textContent = 'התחבר'; refresh(); }, 3000);
+}
+
+const CMD_LABEL = { cad: 'Ctrl+Alt+Del', lock: 'נעילה', logoff: 'התנתקות משתמש', restart: 'אתחול', shutdown: 'כיבוי' };
+async function sendCommand(c, action) {
+  if (!action) return;
+  if (['logoff', 'restart', 'shutdown'].includes(action) && !confirm(`לבצע "${CMD_LABEL[action]}" במחשב ${c.number}?`)) return;
+  try {
+    await api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action } });
+    alert(`"${CMD_LABEL[action]}" נשלח למחשב ${c.number} (יתבצע תוך כמה שניות)`);
+  } catch (e) { alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message); }
 }
 
 async function rename(c) {
