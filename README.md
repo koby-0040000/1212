@@ -94,7 +94,13 @@ for remote control (the dashboard shows "VNC: ready / not available" per compute
 
 Each card shows a status report: logged-in user, CPU, RAM, disk C:, uptime, IP, VNC.
 A computer with no heartbeat for ~25 seconds shows as off. Agent log:
-`C:\ProgramData\SionyxAgent\agent.log`. Remove:
+`C:\ProgramData\SionyxAgent\agent.log`.
+
+**Remove from a computer:** in the dashboard pick "הסר תוכנה מהמחשב" in the command dropdown
+(computer must be online, requires agent v3+ - re-run the installer once on older computers).
+The agent notifies the server (the computer disappears from the list), then a one-time SYSTEM
+task deletes the `SionyxAgent` scheduled task and `C:\ProgramData\SionyxAgent`. TightVNC and the
+Ctrl+Alt+Del policy are left as-is. Manual removal:
 `Unregister-ScheduledTask -TaskName SionyxAgent -Confirm:$false`.
 
 How Connect works: the dashboard creates a one-time token, the agent receives it in its
@@ -105,7 +111,7 @@ viewer page joins the same room. Nothing else in the relay changed.
 
 - The agent runs as a SYSTEM scheduled task at startup, so it works with nobody logged in and
   survives logout. The installer also sets TightVNC's service (`tvnserver`) to start automatically.
-- Dashboard dropdown per computer: Ctrl+Alt+Del, lock, log off user, restart, shutdown. Only this
+- Dashboard dropdown per computer: Ctrl+Alt+Del, lock, log off user, restart, shutdown, uninstall agent. Only this
   fixed list is accepted - the agent never runs arbitrary commands. A queued command expires after 60s.
 - The viewer's existing **Ctrl+Alt+Del** button also works with this agent (control channel).
   The viewer's "elevated click" and "type text" buttons are not implemented by this agent.

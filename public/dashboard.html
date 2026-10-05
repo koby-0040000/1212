@@ -106,8 +106,8 @@ function render() {
     const top = document.createElement('div'); top.className = 'top';
     const num = document.createElement('span'); num.className = 'num'; num.textContent = 'מחשב ' + c.number;
     const badge = document.createElement('span');
-    badge.className = 'badge' + (c.busy ? ' busy' : c.online ? ' online' : '');
-    badge.textContent = c.busy ? 'בשליטה' : c.online ? 'פעיל' : 'כבוי';
+    badge.className = 'badge' + (c.uninstalling ? ' busy' : c.busy ? ' busy' : c.online ? ' online' : '');
+    badge.textContent = c.uninstalling ? 'מסיר...' : c.busy ? 'בשליטה' : c.online ? 'פעיל' : 'כבוי';
     top.append(num, badge);
     const sub = document.createElement('div'); sub.className = 'sub';
     sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
@@ -127,12 +127,12 @@ function render() {
       add(st.vnc ? 'VNC: מוכן' : 'VNC: לא זמין - שליטה לא תעבוד', !st.vnc);
     }
     const row = document.createElement('div'); row.className = 'row';
-    const go = document.createElement('button'); go.className = 'primary'; go.textContent = 'התחבר'; go.disabled = !c.online;
+    const go = document.createElement('button'); go.className = 'primary'; go.textContent = 'התחבר'; go.disabled = !c.online || c.uninstalling;
     go.onclick = () => connect(c, go);
     const ren = document.createElement('button'); ren.className = 'small'; ren.textContent = 'שם'; ren.title = 'שינוי שם';
     ren.onclick = () => rename(c);
-    const cmd = document.createElement('select'); cmd.className = 'small'; cmd.disabled = !c.online; cmd.title = 'שלח פקודה למחשב';
-    for (const [v, t] of [['', 'פקודה...'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['restart', 'אתחול'], ['shutdown', 'כיבוי']]) {
+    const cmd = document.createElement('select'); cmd.className = 'small'; cmd.disabled = !c.online || c.uninstalling; cmd.title = 'שלח פקודה למחשב';
+    for (const [v, t] of [['', 'פקודה...'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['restart', 'אתחול'], ['shutdown', 'כיבוי'], ['uninstall', 'הסר תוכנה מהמחשב']]) {
       const o = document.createElement('option'); o.value = v; o.textContent = t; cmd.appendChild(o);
     }
     cmd.onchange = () => { const v = cmd.value; cmd.value = ''; cmd.blur(); sendCommand(c, v); };
@@ -170,13 +170,18 @@ async function connect(c, btn) {
   setTimeout(() => { btn.textContent = 'התחבר'; refresh(); }, 3000);
 }
 
-const CMD_LABEL = { cad: 'Ctrl+Alt+Del', lock: 'נעילה', logoff: 'התנתקות משתמש', restart: 'אתחול', shutdown: 'כיבוי' };
+const CMD_LABEL = { cad: 'Ctrl+Alt+Del', lock: 'נעילה', logoff: 'התנתקות משתמש', restart: 'אתחול', shutdown: 'כיבוי', uninstall: 'הסרת התוכנה מהמחשב' };
 async function sendCommand(c, action) {
   if (!action) return;
-  if (['logoff', 'restart', 'shutdown'].includes(action) && !confirm(`לבצע "${CMD_LABEL[action]}" במחשב ${c.number}?`)) return;
+  if (action === 'uninstall') {
+    if (!confirm(`להסיר את התוכנה ממחשב ${c.number}?\n\nהסוכן יימחק מהמחשב עצמו (המשימה המתוזמנת והתיקייה C:\\ProgramData\\SionyxAgent), והמחשב יימחק מהרשימה.\nאחרי זה לא תהיה אפשרות שליטה מרחוק עד שתתקין מחדש.`)) return;
+  } else if (['logoff', 'restart', 'shutdown'].includes(action) && !confirm(`לבצע "${CMD_LABEL[action]}" במחשב ${c.number}?`)) return;
   try {
     await api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action } });
-    alert(`"${CMD_LABEL[action]}" נשלח למחשב ${c.number} (יתבצע תוך כמה שניות)`);
+    alert(action === 'uninstall'
+      ? `פקודת ההסרה נשלחה למחשב ${c.number}. תוך כמה שניות התוכנה תימחק מהמחשב והוא ייעלם מהרשימה.`
+      : `"${CMD_LABEL[action]}" נשלח למחשב ${c.number} (יתבצע תוך כמה שניות)`);
+    refresh();
   } catch (e) { alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message); }
 }
 

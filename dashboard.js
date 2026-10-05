@@ -30,7 +30,8 @@ const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
-const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown']);
+const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall']);
+const UNINSTALL_WAIT_MS = 2 * 60 * 1000; // how long the dashboard shows "removing..." before giving up
 const COMMAND_TTL_MS = 60 * 1000; // a queued command the agent does not pick up in time is dropped
 const NUMBER_RE = /^[A-Za-z0-9_-]{1,32}$/;
 
@@ -116,6 +117,7 @@ const isOnline = (c) => !!c.lastSeen && Date.now() - c.lastSeen < ONLINE_MS;
 const view = (c) => ({
   number: c.number, name: c.name || '', hostname: c.hostname || '',
   online: isOnline(c), busy: isOnline(c) && !!c.busy,
+  uninstalling: !!c.uninstallAt && Date.now() - c.uninstallAt < UNINSTALL_WAIT_MS,
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
   stats: c.stats || null,
 });
@@ -172,6 +174,7 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   if (!COMMANDS.has(action)) return res.status(400).json({ error: 'unknown action' });
   c.commands = (c.commands || []).slice(-4);
   c.commands.push({ action, at: Date.now() });
+  if (action === 'uninstall') c.uninstallAt = Date.now();
   console.log(`[dash] command ${action} queued for computer ${c.number}`);
   res.json({ ok: true });
 });
@@ -232,6 +235,19 @@ router.post('/agent/heartbeat', (req, res) => {
   c.commands = [];
   scheduleSave();
   res.json({ session, commands });
+});
+
+// The agent calls this right before it deletes itself from the computer: the computer is
+// removed from the registry (so it does not stay in the dashboard as "off").
+router.post('/agent/uninstalled', (req, res) => {
+  if (!AGENT_KEY) return res.status(503).json({ error: 'AGENT_KEY is not set on the server' });
+  if (!safeEq(req.get('x-agent-key') || '', AGENT_KEY)) return res.status(401).json({ error: 'bad agent key' });
+  const number = String((req.body && req.body.number) || '').trim();
+  if (!NUMBER_RE.test(number)) return res.status(400).json({ error: 'bad computer number' });
+  computers.delete(number);
+  scheduleSave();
+  console.log(`[dash] computer ${number} uninstalled the agent and was removed`);
+  res.json({ ok: true });
 });
 
 module.exports = function mount(app) {

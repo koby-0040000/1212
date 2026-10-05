@@ -6,7 +6,8 @@
 # Normal install: download the installer from the dashboard (button) and double-click it.
 # Manual install (PowerShell as Administrator):
 #   .\sionyx-agent.ps1 -ComputerNumber 12 -Key "<AGENT_KEY>" -Server "https://<name>.onrender.com" -Install
-# Remove:  Unregister-ScheduledTask -TaskName SionyxAgent -Confirm:$false
+# Remove:  press "Remove software from computer" in the dashboard (or manually:
+#          Unregister-ScheduledTask -TaskName SionyxAgent -Confirm:$false)
 param(
   [Parameter(Mandatory = $true)][string]$ComputerNumber,
   [Parameter(Mandatory = $true)][string]$Key,
@@ -56,6 +57,42 @@ try {
 '@
 } catch { }
 
+# Removes the agent from this computer: tells the server, then a one-time SYSTEM task
+# (independent of this process, so it is not killed with it) deletes the scheduled task and
+# the C:\ProgramData\SionyxAgent folder. TightVNC itself is NOT touched.
+function Start-Uninstall {
+  Log 'uninstall requested - removing the agent from this computer'
+  try {
+    $body = @{ number = $ComputerNumber } | ConvertTo-Json -Compress
+    Invoke-RestMethod -Method Post -Uri "$Server/api/agent/uninstalled" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 20 | Out-Null
+  } catch { Log "could not notify the server: $($_.Exception.Message)" }
+
+  $cleanup = Join-Path $env:TEMP 'sionyx-cleanup.ps1'
+  $code = @"
+Start-Sleep -Seconds 4
+Stop-ScheduledTask -TaskName 'SionyxAgent' -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'SionyxAgent' -Confirm:`$false -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { `$_.CommandLine -like '*SionyxAgent*agent.ps1*' -and `$_.ProcessId -ne `$PID } | ForEach-Object { Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
+Remove-Item -LiteralPath '$Dir' -Recurse -Force -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'SionyxAgentCleanup' -Confirm:`$false -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath `$MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+"@
+  try {
+    [IO.File]::WriteAllText($cleanup, $code)
+    $cleanArg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$cleanup`""
+    $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $cleanArg
+    $pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName 'SionyxAgentCleanup' -Action $act -Principal $pr -Force | Out-Null
+    Start-ScheduledTask -TaskName 'SionyxAgentCleanup'
+  } catch {
+    Log "cleanup task failed ($($_.Exception.Message)) - trying a plain process"
+    try { Start-Process -FilePath 'powershell.exe' -ArgumentList $cleanArg -WindowStyle Hidden } catch { Log "cleanup failed: $($_.Exception.Message)" }
+  }
+  Log 'agent exiting'
+  exit 0   # stop right away so it does not send another heartbeat and re-register
+}
+
 # Fixed whitelist only - the agent never runs arbitrary commands from the server.
 function Run-Command([string]$cmd) {
   Log "command: $cmd"
@@ -67,6 +104,7 @@ function Run-Command([string]$cmd) {
       'logoff'   { $id = [Sx.Native]::WTSGetActiveConsoleSessionId(); if ($id -ne $none) { & logoff.exe $id } }
       'restart'  { & shutdown.exe /r /t 5 /f }
       'shutdown' { & shutdown.exe /s /t 5 /f }
+      'uninstall' { Start-Uninstall }
       default    { Log "unknown command ignored: $cmd" }
     }
   } catch { Log "command failed: $($_.Exception.Message)" }
@@ -98,7 +136,7 @@ function Test-Vnc {
 }
 
 function Get-Stats {
-  $s = @{ agent = '2'; vnc = (Test-Vnc) }
+  $s = @{ agent = '3'; vnc = (Test-Vnc) }
   try {
     $os = Get-CimInstance Win32_OperatingSystem
     $s.os = [string]$os.Caption
