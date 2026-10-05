@@ -87,7 +87,9 @@ Two addresses once deployed on Render:
 1. Open `/dashboard`, press **Download installer** (`sionyx-install.cmd`; the server URL and
    agent key are already inside it).
 2. Copy it to the computer and double-click. Accept the Windows admin prompt, type the
-   computer number, done. It installs a startup task and the computer shows up in the dashboard.
+   computer number, press **Install**, done. A small graphical window (no black console) shows
+   the progress step by step and the result. It installs a startup task and the computer shows up
+   in the dashboard. On a computer that already has the agent, the number is pre-filled.
 
 Re-running the installer updates the agent. TightVNC must be running on `127.0.0.1:5900`
 for remote control (the dashboard shows "VNC: ready / not available" per computer).

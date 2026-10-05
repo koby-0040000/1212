@@ -5,41 +5,111 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SIONYX - דשבורד מחשבים</title>
 <style>
-  :root { --bg:#f5f6f8; --card:#fff; --text:#1c1f24; --muted:#6b7280; --line:#e2e5ea; --ok:#16a34a; --off:#9ca3af; --busy:#d97706; --accent:#2563eb; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --card:#1e2127; --text:#e8eaed; --muted:#9aa0a6; --line:#2e333b; --accent:#5b8def; } }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, "Segoe UI", Arial, sans-serif; }
-  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:16px 20px; border-bottom:1px solid var(--line); background:var(--card); }
-  h1 { font-size:18px; margin:0; }
-  .stats { color:var(--muted); font-size:14px; }
-  .stats b { color:var(--text); }
-  .tools { display:flex; gap:8px; align-items:center; }
-  input[type=text], input[type=password] { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); font-size:14px; }
-  button { padding:8px 14px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--text); cursor:pointer; font-size:14px; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button:disabled { opacity:.45; cursor:not-allowed; }
-  main { padding:20px; display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:14px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:8px; }
-  .top { display:flex; justify-content:space-between; align-items:center; }
-  .num { font-size:20px; font-weight:700; }
-  .badge { font-size:12px; padding:3px 9px; border-radius:999px; color:#fff; background:var(--off); }
-  .badge.online { background:var(--ok); } .badge.busy { background:var(--busy); }
-  .sub { color:var(--muted); font-size:13px; min-height:18px; }
-  .row { display:flex; gap:6px; }
-  .row button { flex:1; }
-  .small { padding:5px 8px; font-size:12px; flex:0 0 auto; }
-  .empty, .msg { grid-column:1/-1; text-align:center; color:var(--muted); padding:40px 0; }
-  #login { max-width:320px; margin:12vh auto; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px; display:flex; flex-direction:column; gap:12px; }
-  #login .err { color:#dc2626; font-size:13px; min-height:16px; }
-  .stat { font-size:13px; color:var(--text); line-height:1.5; }
-  .stat.warn { color:var(--busy); }
-  a { text-decoration:none; }
+  :root {
+    --bg:#eef1f7; --card:#ffffff; --text:#1b2333; --muted:#6a7488; --line:#e1e6ef;
+    --ok:#16a34a; --off:#9aa3b2; --busy:#d97706; --bad:#dc2626; --accent:#2563eb; --accent2:#7c3aed;
+    --shadow:0 1px 2px rgba(20,30,60,.06), 0 6px 18px rgba(20,30,60,.06);
+    --shadow-hover:0 2px 4px rgba(20,30,60,.08), 0 14px 32px rgba(37,99,235,.16);
+    --track:#e8ecf4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1218; --card:#1a1f29; --text:#e9ecf3; --muted:#98a2b5; --line:#2a313e; --accent:#5b8def; --accent2:#9b7bff;
+            --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.35); --shadow-hover:0 2px 4px rgba(0,0,0,.5), 0 14px 32px rgba(91,141,239,.22); --track:#2a313e; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,"Segoe UI",Arial,sans-serif; }
   .hidden { display:none !important; }
+  a { text-decoration:none; }
+
+  /* ---------- header ---------- */
+  header { position:sticky; top:0; z-index:5; color:#fff; padding:16px 22px;
+           background:linear-gradient(120deg,var(--accent) 0%,var(--accent2) 100%); box-shadow:0 4px 18px rgba(37,99,235,.28);
+           display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:space-between; }
+  .brand { display:flex; align-items:center; gap:12px; }
+  .logo { width:42px; height:42px; border-radius:12px; background:rgba(255,255,255,.18); display:grid; place-items:center; font-size:22px; backdrop-filter:blur(4px); }
+  h1 { font-size:19px; margin:0; letter-spacing:.2px; }
+  .live { font-size:12px; opacity:.85; display:flex; align-items:center; gap:6px; margin-top:2px; }
+  .live i { width:8px; height:8px; border-radius:50%; background:#4ade80; animation:pulse 1.6s infinite; }
+  .chips { display:flex; gap:10px; flex-wrap:wrap; }
+  .chip { background:rgba(255,255,255,.16); border-radius:12px; padding:6px 14px; text-align:center; min-width:74px; backdrop-filter:blur(4px); }
+  .chip b { display:block; font-size:20px; line-height:1.15; }
+  .chip span { font-size:11px; opacity:.85; }
+  .tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  header input[type=text] { padding:9px 12px; border:0; border-radius:10px; background:rgba(255,255,255,.18); color:#fff; font-size:14px; min-width:170px; outline:none; }
+  header input::placeholder { color:rgba(255,255,255,.75); }
+  header input:focus { background:rgba(255,255,255,.28); }
+  header button { background:rgba(255,255,255,.16); border:0; color:#fff; }
+  header button:hover { background:rgba(255,255,255,.28); }
+  header button.primary { background:#fff; color:var(--accent); font-weight:600; }
+  header button.primary:hover { background:#f1f5ff; }
+
+  button { padding:8px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--text); cursor:pointer; font-size:14px; transition:transform .12s, background .15s, box-shadow .15s; }
+  button:active:not(:disabled) { transform:scale(.96); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover:not(:disabled) { filter:brightness(1.1); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=password] { padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--bg); color:var(--text); font-size:14px; }
+
+  /* ---------- grid + cards ---------- */
+  main { padding:22px; display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:16px; }
+  .card { position:relative; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px 16px 14px; display:flex; flex-direction:column; gap:10px;
+          box-shadow:var(--shadow); overflow:hidden; transition:transform .18s, box-shadow .18s, opacity .3s, filter .3s; }
+  .card::before { content:""; position:absolute; inset:0 0 auto 0; height:4px; background:var(--off); transition:background .3s; }
+  .card.s-online::before { background:linear-gradient(90deg,#22c55e,#16a34a); }
+  .card.s-busy::before, .card.s-removing::before { background:linear-gradient(90deg,#f59e0b,#d97706); }
+  .card.s-failed::before { background:linear-gradient(90deg,#ef4444,#dc2626); }
+  .card:hover { transform:translateY(-3px); box-shadow:var(--shadow-hover); }
+  .card.s-off { opacity:.72; filter:saturate(.55); }
+  .card.enter { animation:rise .45s cubic-bezier(.2,.8,.2,1) both; }
+  .top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .num { font-size:20px; font-weight:700; display:flex; align-items:center; gap:8px; }
+  .num .pc { font-size:20px; }
+  .badge { font-size:12px; padding:4px 10px; border-radius:999px; color:#fff; background:var(--off); display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
+  .badge.online { background:var(--ok); } .badge.busy, .badge.removing { background:var(--busy); } .badge.failed { background:var(--bad); }
+  .badge .dot { width:7px; height:7px; border-radius:50%; background:#fff; }
+  .badge.online .dot { animation:pulse 1.6s infinite; }
+  .badge.removing .dot { width:10px; height:10px; background:none; border:2px solid #fff; border-top-color:transparent; animation:spin .8s linear infinite; }
+  .sub { color:var(--muted); font-size:13px; min-height:18px; }
+  .note { font-size:12px; padding:7px 10px; border-radius:10px; background:rgba(220,38,38,.1); color:var(--bad); }
+  .gauges { display:flex; flex-direction:column; gap:8px; }
+  .g-head { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-bottom:3px; }
+  .g-head b { color:var(--text); font-weight:600; }
+  .track { height:8px; border-radius:99px; background:var(--track); overflow:hidden; }
+  .fill { height:100%; width:0; border-radius:99px; background:var(--ok); transition:width .8s cubic-bezier(.2,.8,.2,1), background .4s; }
+  .fill.warn { background:var(--busy); } .fill.bad { background:var(--bad); }
+  .tags { display:flex; flex-wrap:wrap; gap:6px; }
+  .tag { font-size:12px; padding:3px 9px; border-radius:8px; background:var(--track); color:var(--text); }
+  .tag.ok { background:rgba(22,163,74,.14); color:var(--ok); } .tag.warn { background:rgba(217,119,6,.15); color:var(--busy); }
+  .row { display:flex; gap:6px; margin-top:2px; }
+  .row .primary { flex:1; }
+  .small { padding:6px 9px; font-size:12px; }
+  select.small { border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--text); max-width:120px; cursor:pointer; }
+  .empty { grid-column:1/-1; text-align:center; color:var(--muted); padding:70px 10px; line-height:1.9; }
+  .empty .big { font-size:46px; display:block; margin-bottom:6px; animation:float 3s ease-in-out infinite; }
+
+  /* ---------- login ---------- */
+  #login { max-width:340px; margin:11vh auto; background:var(--card); border:1px solid var(--line); border-radius:18px; padding:28px 24px; display:flex; flex-direction:column; gap:14px; box-shadow:var(--shadow); text-align:center; animation:rise .5s both; }
+  #login .logo { margin:0 auto; background:linear-gradient(120deg,var(--accent),var(--accent2)); color:#fff; width:56px; height:56px; font-size:28px; }
+  #login h1 { font-size:20px; }
+  #login .err { color:var(--bad); font-size:13px; min-height:16px; }
+
+  /* ---------- toast ---------- */
+  #toasts { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); display:flex; flex-direction:column; gap:8px; z-index:20; align-items:center; pointer-events:none; }
+  .toast { background:#1f2937; color:#fff; padding:11px 18px; border-radius:12px; font-size:14px; box-shadow:0 10px 30px rgba(0,0,0,.3); max-width:90vw; animation:rise .3s both; pointer-events:auto; }
+  .toast.err { background:var(--bad); } .toast.ok { background:var(--ok); }
+  .toast.out { opacity:0; transform:translateY(8px); transition:.3s; }
+
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(74,222,128,.7)} 70%{box-shadow:0 0 0 7px rgba(74,222,128,0)} 100%{box-shadow:0 0 0 0 rgba(74,222,128,0)} }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @keyframes rise { from { opacity:0; transform:translateY(14px) scale(.98); } to { opacity:1; transform:none; } }
+  @keyframes float { 0%,100% { transform:translateY(0); } 50% { transform:translateY(-6px); } }
+  @media (prefers-reduced-motion: reduce) { * { animation:none !important; transition:none !important; } }
 </style>
 </head>
 <body>
 
 <div id="login" class="hidden">
+  <div class="logo">&#128421;</div>
   <h1>כניסה לדשבורד</h1>
   <input id="pw" type="password" placeholder="סיסמה" autocomplete="current-password">
   <button class="primary" id="loginBtn">כניסה</button>
@@ -48,22 +118,39 @@
 
 <div id="app" class="hidden">
   <header>
-    <div>
-      <h1>מחשבים מרוחקים</h1>
-      <div class="stats">פעילים: <b id="sOnline">0</b> מתוך <b id="sTotal">0</b></div>
+    <div class="brand">
+      <div class="logo">&#128421;</div>
+      <div>
+        <h1>מחשבים מרוחקים</h1>
+        <div class="live"><i></i> מתעדכן אוטומטית</div>
+      </div>
+    </div>
+    <div class="chips">
+      <div class="chip"><b id="sOnline">0</b><span>פעילים</span></div>
+      <div class="chip"><b id="sOff">0</b><span>כבויים</span></div>
+      <div class="chip"><b id="sTotal">0</b><span>סה״כ</span></div>
     </div>
     <div class="tools">
-      <input id="q" type="text" placeholder="חיפוש מספר / שם">
-      <a href="/api/installer" download><button class="primary" type="button">הורד מתקין</button></a>
+      <input id="q" type="text" placeholder="&#128269; חיפוש מספר / שם">
+      <a href="/api/installer" download><button class="primary" type="button">&#11015; הורד מתקין</button></a>
       <button id="logout">יציאה</button>
     </div>
   </header>
   <main id="grid"></main>
 </div>
+<div id="toasts"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let data = [], timer = null;
+const cards = new Map();      // computer number -> { el, refs }
+let emptyEl = null;
+
+function toast(msg, kind) {
+  const t = document.createElement('div'); t.className = 'toast ' + (kind || ''); t.textContent = msg;
+  $('toasts').appendChild(t);
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 350); }, kind === 'err' ? 6500 : 4000);
+}
 
 async function api(path, opts = {}) {
   const res = await fetch('/api' + path, {
@@ -90,69 +177,113 @@ function ago(ms) {
   return `לפני ${Math.round(s / 86400)} ימים`;
 }
 
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+function makeGauge(label) {
+  const wrap = el('div'), head = el('div', 'g-head'), l = el('span', null, label), v = el('b');
+  head.append(l, v);
+  const track = el('div', 'track'), fill = el('div', 'fill'); track.appendChild(fill);
+  wrap.append(head, track);
+  return { wrap, set(pct, text) {
+    v.textContent = text;
+    fill.style.width = Math.max(2, Math.min(100, pct)) + '%';
+    fill.className = 'fill' + (pct >= 90 ? ' bad' : pct >= 70 ? ' warn' : '');
+  } };
+}
+
+function makeCard(c) {
+  const card = el('div', 'card enter');
+  const top = el('div', 'top');
+  const num = el('span', 'num'); const pc = el('span', 'pc', '\u{1F5A5}\uFE0F'); const numTxt = el('span', null, 'מחשב ' + c.number); num.append(pc, numTxt);
+  const badge = el('span', 'badge'); const dot = el('i', 'dot'); const badgeTxt = el('span'); badge.append(dot, badgeTxt);
+  top.append(num, badge);
+  const sub = el('div', 'sub'), seen = el('div', 'sub'), note = el('div', 'note');
+  const gauges = el('div', 'gauges');
+  const gCpu = makeGauge('מעבד'), gRam = makeGauge('זיכרון'), gDisk = makeGauge('דיסק C:');
+  gauges.append(gCpu.wrap, gRam.wrap, gDisk.wrap);
+  const tags = el('div', 'tags');
+  const row = el('div', 'row');
+  const go = el('button', 'primary', 'התחבר');
+  const ren = el('button', 'small', 'שם'); ren.title = 'שינוי שם';
+  const cmd = el('select', 'small'); cmd.title = 'שלח פקודה למחשב';
+  for (const [v, t] of [['', 'פקודה...'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['restart', 'אתחול'], ['shutdown', 'כיבוי'], ['uninstall', 'הסר תוכנה מהמחשב']]) {
+    const o = el('option', null, t); o.value = v; cmd.appendChild(o);
+  }
+  const del = el('button', 'small', 'הסר'); del.title = 'הסר מהרשימה';
+  row.append(go, ren, cmd, del);
+  card.append(top, sub, seen, note, gauges, tags, row);
+  card.addEventListener('animationend', () => card.classList.remove('enter'), { once: true });
+  const entry = { el: card, c, refs: { numTxt, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, del } };
+  go.onclick = () => connect(entry.c, go);
+  ren.onclick = () => rename(entry.c);
+  del.onclick = () => forget(entry.c);
+  cmd.onchange = () => { const v = cmd.value; cmd.value = ''; cmd.blur(); sendCommand(entry.c, v); };
+  return entry;
+}
+
+function paint(entry, c) {
+  entry.c = c;
+  const r = entry.refs, st = c.stats;
+  const state = c.uninstalling ? 'removing' : c.uninstallFailed ? 'failed' : c.busy ? 'busy' : c.online ? 'online' : 'off';
+  entry.el.className = 'card s-' + state + (entry.el.classList.contains('enter') ? ' enter' : '');
+  r.badge.className = 'badge ' + state;
+  r.badgeTxt.textContent = { removing: 'מסיר...', failed: 'ההסרה נכשלה', busy: 'בשליטה', online: 'פעיל', off: 'כבוי' }[state];
+  r.sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
+  r.seen.textContent = 'נראה לאחרונה: ' + (c.online ? 'עכשיו' : ago(c.lastSeen));
+  r.note.style.display = state === 'failed' ? '' : 'none';
+  r.note.textContent = 'המחשב ממשיך להגיב, ולכן התוכנה לא הוסרה. ייתכן שהקובץ ממתין לאישור בסינון, או שהסוכן ישן. אפשר לנסות שוב.';
+  r.tags.textContent = '';
+  const show = c.online && st;
+  r.gauges.style.display = show ? '' : 'none';
+  r.tags.style.display = show ? '' : 'none';
+  if (show) {
+    if (st.cpuPct != null) r.gCpu.set(st.cpuPct, st.cpuPct + '%'); else r.gCpu.set(0, '-');
+    if (st.ramTotalGb != null && st.ramFreeGb != null) { const used = st.ramTotalGb - st.ramFreeGb; r.gRam.set(used / st.ramTotalGb * 100, used.toFixed(1) + ' / ' + st.ramTotalGb + ' GB'); } else r.gRam.set(0, '-');
+    if (st.diskTotalGb != null && st.diskFreeGb != null) { r.gDisk.set((st.diskTotalGb - st.diskFreeGb) / st.diskTotalGb * 100, st.diskFreeGb + ' GB פנוי'); } else r.gDisk.set(0, '-');
+    const tag = (t, cls) => r.tags.appendChild(el('span', 'tag' + (cls ? ' ' + cls : ''), t));
+    if (st.user) tag('\u{1F464} ' + st.user.split('\\').pop());
+    if (st.ip) tag('\u{1F310} ' + st.ip);
+    if (st.uptimeHours != null) tag('\u23F1 ' + (st.uptimeHours < 1 ? Math.round(st.uptimeHours * 60) + ' דק׳' : st.uptimeHours + ' שע׳'));
+    tag(st.vnc ? '\u2714 VNC מוכן' : '\u26A0 VNC לא זמין', st.vnc ? 'ok' : 'warn');
+  }
+  r.go.disabled = !c.online || c.uninstalling;
+  r.cmd.disabled = !c.online || c.uninstalling;
+  r.del.style.display = c.online ? 'none' : '';
+}
+
 function render() {
   const q = $('q').value.trim().toLowerCase();
   const list = data
     .filter((c) => !q || c.number.toLowerCase().includes(q) || c.name.toLowerCase().includes(q) || c.hostname.toLowerCase().includes(q))
     .sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true }));
-  const grid = $('grid'); grid.textContent = '';
+  const grid = $('grid');
   if (!list.length) {
-    const d = document.createElement('div'); d.className = 'empty';
-    d.textContent = data.length ? 'לא נמצאו תוצאות' : 'עדיין אין מחשבים רשומים. לחץ "הורד מתקין", הרץ אותו על המחשב (לחיצה כפולה), והוא יופיע כאן.';
-    grid.appendChild(d); return;
+    for (const [, e] of cards) e.el.remove(); cards.clear();
+    if (!emptyEl) {
+      emptyEl = el('div', 'empty');
+      emptyEl.append(el('span', 'big', '\u{1F5A5}\uFE0F'));
+    }
+    emptyEl.lastChild.nodeType === 3 && emptyEl.lastChild.remove();
+    emptyEl.append(document.createTextNode(data.length ? 'לא נמצאו תוצאות' : 'עדיין אין מחשבים רשומים. לחץ "הורד מתקין", הרץ אותו על המחשב (לחיצה כפולה), והוא יופיע כאן.'));
+    if (!emptyEl.parentNode) grid.appendChild(emptyEl);
+    return;
   }
-  for (const c of list) {
-    const card = document.createElement('div'); card.className = 'card';
-    const top = document.createElement('div'); top.className = 'top';
-    const num = document.createElement('span'); num.className = 'num'; num.textContent = 'מחשב ' + c.number;
-    const badge = document.createElement('span');
-    badge.className = 'badge' + (c.uninstalling ? ' busy' : c.busy ? ' busy' : c.online ? ' online' : '');
-    badge.textContent = c.uninstalling ? 'מסיר...' : c.uninstallFailed ? 'ההסרה נכשלה' : c.busy ? 'בשליטה' : c.online ? 'פעיל' : 'כבוי';
-    top.append(num, badge);
-    const sub = document.createElement('div'); sub.className = 'sub';
-    sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
-    const seen = document.createElement('div'); seen.className = 'sub';
-    seen.textContent = 'נראה לאחרונה: ' + (c.online ? 'עכשיו' : ago(c.lastSeen));
-    const info = document.createElement('div');
-    if (c.online && c.stats) {
-      const st = c.stats, add = (t, warn) => { const d = document.createElement('div'); d.className = 'stat' + (warn ? ' warn' : ''); d.textContent = t; info.appendChild(d); };
-      if (st.user) add('משתמש: ' + st.user.split('\\').pop());
-      const bits = [];
-      if (st.cpuPct != null) bits.push('מעבד ' + st.cpuPct + '%');
-      if (st.ramTotalGb != null && st.ramFreeGb != null) bits.push('זיכרון ' + (st.ramTotalGb - st.ramFreeGb).toFixed(1) + '/' + st.ramTotalGb + ' GB');
-      if (bits.length) add(bits.join(' · '));
-      if (st.diskTotalGb != null) add('דיסק C: ' + st.diskFreeGb + ' מתוך ' + st.diskTotalGb + ' GB פנוי');
-      if (st.uptimeHours != null) add('דלוק כבר ' + (st.uptimeHours < 1 ? Math.round(st.uptimeHours * 60) + ' דק׳' : st.uptimeHours + ' שע׳'));
-      if (st.ip) add('IP: ' + st.ip);
-      add(st.vnc ? 'VNC: מוכן' : 'VNC: לא זמין - שליטה לא תעבוד', !st.vnc);
-    }
-    const row = document.createElement('div'); row.className = 'row';
-    const go = document.createElement('button'); go.className = 'primary'; go.textContent = 'התחבר'; go.disabled = !c.online || c.uninstalling;
-    go.onclick = () => connect(c, go);
-    const ren = document.createElement('button'); ren.className = 'small'; ren.textContent = 'שם'; ren.title = 'שינוי שם';
-    ren.onclick = () => rename(c);
-    const cmd = document.createElement('select'); cmd.className = 'small'; cmd.disabled = !c.online || c.uninstalling; cmd.title = 'שלח פקודה למחשב';
-    for (const [v, t] of [['', 'פקודה...'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['restart', 'אתחול'], ['shutdown', 'כיבוי'], ['uninstall', 'הסר תוכנה מהמחשב']]) {
-      const o = document.createElement('option'); o.value = v; o.textContent = t; cmd.appendChild(o);
-    }
-    cmd.onchange = () => { const v = cmd.value; cmd.value = ''; cmd.blur(); sendCommand(c, v); };
-    row.append(go, ren, cmd);
-    if (!c.online) {
-      const del = document.createElement('button'); del.className = 'small'; del.textContent = 'הסר'; del.title = 'הסר מהרשימה';
-      del.onclick = () => forget(c);
-      row.append(del);
-    }
-    card.append(top, sub, seen, info, row);
-    grid.appendChild(card);
-  }
+  if (emptyEl && emptyEl.parentNode) emptyEl.remove();
+  const keep = new Set(list.map((c) => c.number));
+  for (const [n, e] of cards) if (!keep.has(n)) { e.el.remove(); cards.delete(n); }
+  list.forEach((c, i) => {
+    let e = cards.get(c.number);
+    if (!e) { e = makeCard(c); cards.set(c.number, e); }
+    paint(e, c);
+    if (grid.children[i] !== e.el) grid.insertBefore(e.el, grid.children[i] || null);
+  });
 }
 
 async function refresh() {
   try {
     const r = await api('/computers');
     data = r.computers;
-    if (document.activeElement && document.activeElement.tagName === 'SELECT') { $('sOnline').textContent = r.online; $('sTotal').textContent = r.total; return; }
-    $('sOnline').textContent = r.online; $('sTotal').textContent = r.total;
+    $('sOnline').textContent = r.online; $('sTotal').textContent = r.total; $('sOff').textContent = r.total - r.online;
     render();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
@@ -165,7 +296,7 @@ async function connect(c, btn) {
     if (w) w.location = r.url; else location.href = r.url;
   } catch (e) {
     if (w) w.close();
-    alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message);
+    toast(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message, 'err');
   }
   setTimeout(() => { btn.textContent = 'התחבר'; refresh(); }, 3000);
 }
@@ -178,13 +309,13 @@ async function sendCommand(c, action) {
   } else if (['logoff', 'restart', 'shutdown'].includes(action) && !confirm(`לבצע "${CMD_LABEL[action]}" במחשב ${c.number}?`)) return;
   try {
     await api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action } });
-    alert(action === 'uninstall'
-      ? `פקודת ההסרה נשלחה למחשב ${c.number}. תוך כמה שניות התוכנה תימחק מהמחשב והוא ייעלם מהרשימה.`
-      : `"${CMD_LABEL[action]}" נשלח למחשב ${c.number} (יתבצע תוך כמה שניות)`);
+    toast(action === 'uninstall'
+      ? `פקודת ההסרה נשלחה למחשב ${c.number}. תוך כמה שניות התוכנה תימחק והוא ייעלם מהרשימה.`
+      : `"${CMD_LABEL[action]}" נשלח למחשב ${c.number} (יתבצע תוך כמה שניות)`, 'ok');
     refresh();
   } catch (e) {
-    if (e.status === 409 && /agent_outdated/.test(e.message || '')) alert(`במחשב ${c.number} רץ סוכן ישן שלא מכיר את פקודת ההסרה.\nיש להריץ עליו את המתקין מחדש פעם אחת (הורד מתקין), ואחר כך אפשר להסיר מרחוק.`);
-    else alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message);
+    if (e.status === 409 && /agent_outdated/.test(e.message || '')) toast(`במחשב ${c.number} רץ סוכן ישן שלא מכיר את פקודת ההסרה. יש להריץ עליו את המתקין מחדש פעם אחת, ואז אפשר להסיר מרחוק.`, 'err');
+    else toast(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message, 'err');
   }
 }
 
