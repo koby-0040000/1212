@@ -4,6 +4,7 @@ if /i "%~1"=="run" goto :main
 start "" /min cmd /c ""%~f0" run"
 exit /b
 :main
+set "SX_SELF=%~dp0"
 net session >nul 2>&1
 if errorlevel 1 goto :elevate
 powershell -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$t=[IO.File]::ReadAllText('%~f0'); $i=$t.LastIndexOf('::PS-'+'BEGIN::'); Invoke-Expression $t.Substring($i+12)"
@@ -16,6 +17,8 @@ $ErrorActionPreference = 'Stop'
 $Server = '__SERVER__'
 $Key = '__KEY__'
 $AgentB64 = '__AGENT_B64__'
+$VncPass = '__VNCPASS__'
+$SelfDir = $env:SX_SELF
 
 # hide any console window that is left
 try {
@@ -92,7 +95,7 @@ $hint.Font = New-Object Drawing.Font('Segoe UI', 8.5)
 $hint.AutoSize = $false; $hint.Size = New-Object Drawing.Size(420, 20); $hint.Location = New-Object Drawing.Point(30, 200); $hint.TextAlign = 'MiddleRight'
 
 # step list
-$stepNames = @('הכנת קבצי התוכנה', 'התקנת הסוכן במחשב', 'הגדרות מערכת', 'בדיקת TightVNC', 'חיבור לשרת')
+$stepNames = @('הכנת קבצי התוכנה', 'התקנת הסוכן במחשב', 'הגדרות מערכת', 'התקנה ובדיקת TightVNC', 'חיבור לשרת')
 $steps = @()
 $y = 232
 foreach ($n in $stepNames) {
@@ -139,6 +142,55 @@ function Set-Step($i, $state) {
 }
 function Wait-Ms($ms) { $end = (Get-Date).AddMilliseconds($ms); while ((Get-Date) -lt $end) { Pump; Start-Sleep -Milliseconds 30 } }
 
+# ---- TightVNC auto-install (only when the tvnserver service is missing) ----
+function Get-RemoteFile($url, $dest) {
+  try {
+    $hc = New-Object Net.Http.HttpClient
+    $hc.Timeout = [TimeSpan]::FromSeconds(180)
+    $task = $hc.GetByteArrayAsync($url)
+    while (-not $task.IsCompleted) { Pump; Start-Sleep -Milliseconds 40 }
+    if ($task.IsFaulted -or $task.IsCanceled) { return $false }
+    $bytes = $task.Result
+    if ($bytes.Length -lt 500000) { return $false }   # not a real MSI (error page etc.)
+    [IO.File]::WriteAllBytes($dest, $bytes)
+    return $true
+  } catch { return $false }
+}
+
+function Install-TightVnc {
+  $arch = if ([Environment]::Is64BitOperatingSystem) { '64bit' } else { '32bit' }
+  $name = "tightvnc-setup-$arch.msi"
+  $msi = Join-Path $env:TEMP $name
+  Remove-Item $msi -ErrorAction SilentlyContinue
+  $got = $false
+  # 1. an MSI placed next to this installer (offline / USB stick)
+  if ($SelfDir) {
+    $local = Get-ChildItem -Path $SelfDir -Filter "*tightvnc*$arch*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($local) { Copy-Item $local.FullName $msi -Force; $got = $true }
+  }
+  # 2. from our own server (public/<name>) - works behind NetFree
+  if (-not $got) { $got = Get-RemoteFile "$Server/$name" $msi }
+  # 3. from tightvnc.com
+  if (-not $got) { $got = Get-RemoteFile "https://www.tightvnc.com/download/2.8.87/tightvnc-2.8.87-gpl-setup-$arch.msi" $msi }
+  if (-not $got) { return 'לא נמצא קובץ התקנה של TightVNC' }
+
+  $pw = $VncPass; if ($pw.Length -gt 8) { $pw = $pw.Substring(0, 8) }   # VNC auth only uses 8 chars
+  $a = @('/i', "`"$msi`"", '/quiet', '/norestart', 'ADDLOCAL=Server', 'SERVER_REGISTER_AS_SERVICE=1',
+         'SERVER_ADD_FIREWALL_EXCEPTION=0',
+         'SET_ALLOWLOOPBACK=1', 'VALUE_OF_ALLOWLOOPBACK=1',
+         'SET_LOOPBACKONLY=1', 'VALUE_OF_LOOPBACKONLY=1')
+  if ($pw) {
+    $a += @('SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1', 'SET_PASSWORD=1', ('VALUE_OF_PASSWORD="' + ($pw -replace '"', '""') + '"'))
+  } else {
+    $a += @('SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=0')
+  }
+  $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList $a -PassThru -WindowStyle Hidden
+  while (-not $p.HasExited) { Pump; Start-Sleep -Milliseconds 40 }
+  Remove-Item $msi -ErrorAction SilentlyContinue
+  if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { return ('התקנת TightVNC נכשלה (קוד ' + $p.ExitCode + ')') }
+  return $null
+}
+
 function Do-Install {
   $num = $box.Text.Trim()
   if ($num -notmatch '^[A-Za-z0-9_-]{1,32}$') {
@@ -175,12 +227,20 @@ function Do-Install {
     # 4. TightVNC
     Set-Step 3 'run'
     $svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
+    if (-not $svc) {
+      $ierr = Install-TightVnc
+      if ($ierr) { [void]$problems.Add($ierr) }
+      Wait-Ms 2000
+      $svc = Get-Service -Name 'tvnserver' -ErrorAction SilentlyContinue
+    }
     if ($svc) {
       try { Set-Service -Name 'tvnserver' -StartupType Automatic; if ($svc.Status -ne 'Running') { Start-Service -Name 'tvnserver' } } catch { }
-      Wait-Ms 1500
     }
     $vnc = $false
-    try { $c = New-Object Net.Sockets.TcpClient; $iar = $c.BeginConnect('127.0.0.1', 5900, $null, $null); $vnc = ($iar.AsyncWaitHandle.WaitOne(1000) -and $c.Connected); $c.Close() } catch { }
+    for ($k = 0; $k -lt 10 -and -not $vnc; $k++) {
+      Wait-Ms 1000
+      try { $c = New-Object Net.Sockets.TcpClient; $iar = $c.BeginConnect('127.0.0.1', 5900, $null, $null); $vnc = ($iar.AsyncWaitHandle.WaitOne(1000) -and $c.Connected); $c.Close() } catch { }
+    }
     if ($svc -and $vnc) { Set-Step 3 'ok' }
     elseif ($vnc) { [void]$problems.Add('TightVNC פועל אך לא כשירות - עלול להיעצר בהתנתקות משתמש'); Set-Step 3 'warn' }
     else { [void]$problems.Add('TightVNC לא פועל - המחשב ידווח סטטוס, אך שליטה מרחוק לא תעבוד'); Set-Step 3 'warn' }

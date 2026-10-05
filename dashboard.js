@@ -209,7 +209,7 @@ router.get('/installer', requireAuth, (req, res) => {
   const server = process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
   res.set('Content-Type', 'application/octet-stream');
   res.set('Content-Disposition', 'attachment; filename="sionyx-install.cmd"');
-  res.send(buildInstaller({ server: server.replace(/\/$/, ''), key: AGENT_KEY }));
+  res.send(buildInstaller({ server: server.replace(/\/$/, ''), key: AGENT_KEY, vncPassword: VNC_PASSWORD }));
 });
 
 // Agent heartbeat. Response carries a session token when the admin pressed "connect".

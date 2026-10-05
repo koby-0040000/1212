@@ -109,6 +109,7 @@ app.get('/agent-live.ps1', (_req, res) => {
 
 // Computer registry + /dashboard + /api (see dashboard.js)
 require('./dashboard')(app);
+require('./vncmsi')(app);
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (_req, res) => res.status(200).send('SIONYX VNC Relay is up'));
