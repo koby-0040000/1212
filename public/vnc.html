@@ -214,6 +214,12 @@
       });
     });
 
+    // Closing the tab must tell the relay/agent right away, otherwise the computer
+    // stays "in control" and refuses the next connection.
+    const bye = () => { try { rfb.disconnect(); } catch (e) {} try { channel.close(); } catch (e) {} };
+    window.addEventListener('pagehide', bye);
+    window.addEventListener('beforeunload', bye);
+
     rfb.addEventListener('connect', () => { statusEl.textContent = 'מחובר' + transportLabel; });
     rfb.addEventListener('disconnect', (e) => {
       const clean = e?.detail?.clean;

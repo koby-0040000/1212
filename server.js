@@ -191,6 +191,7 @@ const BACKPRESSURE_THRESHOLD_BYTES = 1 * 1024 * 1024; // 1MB
 // behavior is the same either way - the difference only matters for logging
 // ("joined" vs silently queuing for a room nobody is polling any more).
 const HTTP_ACTIVE_WINDOW_MS = 30000;
+const VIEWER_GONE_MS = 45000; // viewer HTTP poller silent this long => tab closed
 
 // Liveness probe for WebSocket clients that connect with ?probe=1 (the new
 // kiosk build and vnc.html). NetFree can hand the client a 418 (or silently
@@ -734,6 +735,15 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
         wakeWaiters(room, `${ROLE_PAIRS[role]}:drained`);
       }
       if (s.buf.length) break;
+      // The viewer's tab was closed without it being able to tell us (HTTP transport
+      // has no close event). Its long-poll normally refreshes httpSeen every <=25s,
+      // so no sign of life for 45s means it is gone: tell the agent to end the session
+      // (otherwise the agent stays "busy" and no new connection is ever delivered).
+      if (role === 'agent' && !room.peerClosed.agent && room.httpSeen.viewer
+          && !wsUsable(room.viewer) && Date.now() - room.httpSeen.viewer > VIEWER_GONE_MS) {
+        console.log(`[relay] ${ts()} viewer silent >${VIEWER_GONE_MS}ms in room ${label} - closing session for agent`);
+        room.peerClosed.agent = true;
+      }
       if (room.peerClosed[role]) { closedFlag = true; break; }
       const remaining = until - Date.now();
       if (remaining <= 0 || gone) break;
