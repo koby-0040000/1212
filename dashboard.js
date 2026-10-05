@@ -31,6 +31,7 @@ const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick u
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
 const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall']);
+const UNINSTALL_ALIVE_MS = 20 * 1000;
 const UNINSTALL_WAIT_MS = 2 * 60 * 1000; // how long the dashboard shows "removing..." before giving up
 const COMMAND_TTL_MS = 60 * 1000; // a queued command the agent does not pick up in time is dropped
 const NUMBER_RE = /^[A-Za-z0-9_-]{1,32}$/;
@@ -117,7 +118,10 @@ const isOnline = (c) => !!c.lastSeen && Date.now() - c.lastSeen < ONLINE_MS;
 const view = (c) => ({
   number: c.number, name: c.name || '', hostname: c.hostname || '',
   online: isOnline(c), busy: isOnline(c) && !!c.busy,
-  uninstalling: !!c.uninstallAt && Date.now() - c.uninstallAt < UNINSTALL_WAIT_MS,
+  // "removing..." only while the computer has not come back with a heartbeat after the command;
+  // if it is still alive 20s later the removal did not happen -> report a failure instead of hanging.
+  uninstalling: !!c.uninstallAt && Date.now() - c.uninstallAt < UNINSTALL_WAIT_MS && !(c.lastSeen > c.uninstallAt + UNINSTALL_ALIVE_MS),
+  uninstallFailed: !!c.uninstallAt && !!c.lastSeen && c.lastSeen > c.uninstallAt + UNINSTALL_ALIVE_MS,
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
   stats: c.stats || null,
 });
@@ -174,7 +178,11 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   if (!COMMANDS.has(action)) return res.status(400).json({ error: 'unknown action' });
   c.commands = (c.commands || []).slice(-4);
   c.commands.push({ action, at: Date.now() });
-  if (action === 'uninstall') c.uninstallAt = Date.now();
+  if (action === 'uninstall') {
+    // agents older than v3 do not know this command and would ignore it forever
+    if (!c.stats || Number(c.stats.agent) < 3) return res.status(409).json({ error: 'agent_outdated' });
+    c.uninstallAt = Date.now();
+  }
   console.log(`[dash] command ${action} queued for computer ${c.number}`);
   res.json({ ok: true });
 });

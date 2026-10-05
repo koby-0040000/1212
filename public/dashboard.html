@@ -107,7 +107,7 @@ function render() {
     const num = document.createElement('span'); num.className = 'num'; num.textContent = 'מחשב ' + c.number;
     const badge = document.createElement('span');
     badge.className = 'badge' + (c.uninstalling ? ' busy' : c.busy ? ' busy' : c.online ? ' online' : '');
-    badge.textContent = c.uninstalling ? 'מסיר...' : c.busy ? 'בשליטה' : c.online ? 'פעיל' : 'כבוי';
+    badge.textContent = c.uninstalling ? 'מסיר...' : c.uninstallFailed ? 'ההסרה נכשלה' : c.busy ? 'בשליטה' : c.online ? 'פעיל' : 'כבוי';
     top.append(num, badge);
     const sub = document.createElement('div'); sub.className = 'sub';
     sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
@@ -182,7 +182,10 @@ async function sendCommand(c, action) {
       ? `פקודת ההסרה נשלחה למחשב ${c.number}. תוך כמה שניות התוכנה תימחק מהמחשב והוא ייעלם מהרשימה.`
       : `"${CMD_LABEL[action]}" נשלח למחשב ${c.number} (יתבצע תוך כמה שניות)`);
     refresh();
-  } catch (e) { alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message); }
+  } catch (e) {
+    if (e.status === 409 && /agent_outdated/.test(e.message || '')) alert(`במחשב ${c.number} רץ סוכן ישן שלא מכיר את פקודת ההסרה.\nיש להריץ עליו את המתקין מחדש פעם אחת (הורד מתקין), ואחר כך אפשר להסיר מרחוק.`);
+    else alert(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message);
+  }
 }
 
 async function rename(c) {
