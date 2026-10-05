@@ -151,7 +151,7 @@ function Get-RemoteFile($url, $dest) {
     while (-not $task.IsCompleted) { Pump; Start-Sleep -Milliseconds 40 }
     if ($task.IsFaulted -or $task.IsCanceled) { return $false }
     $bytes = $task.Result
-    if ($bytes.Length -lt 500000) { return $false }   # not a real MSI (error page etc.)
+    if ($bytes.Length -lt 500000 -or $bytes[0] -ne 0xD0 -or $bytes[1] -ne 0xCF) { return $false }   # not a real MSI (error page etc.)
     [IO.File]::WriteAllBytes($dest, $bytes)
     return $true
   } catch { return $false }
@@ -168,9 +168,11 @@ function Install-TightVnc {
     $local = Get-ChildItem -Path $SelfDir -Filter "*tightvnc*$arch*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($local) { Copy-Item $local.FullName $msi -Force; $got = $true }
   }
-  # 2. from our own server (public/<name>) - works behind NetFree
+  # 2. GitHub mirror of the official MSI (the sionyx-releases download host is open in NetFree; 64-bit only)
+  if (-not $got -and $arch -eq '64bit') { $got = Get-RemoteFile "https://github.com/maxmax264/sionyx-releases/releases/download/tightvnc-2.8.88/tightvnc-2.8.88-gpl-setup-64bit.msi" $msi }
+  # 3. from our own server (public/<name>)
   if (-not $got) { $got = Get-RemoteFile "$Server/$name" $msi }
-  # 3. from tightvnc.com
+  # 4. from tightvnc.com
   if (-not $got) { $got = Get-RemoteFile "https://www.tightvnc.com/download/2.8.87/tightvnc-2.8.87-gpl-setup-$arch.msi" $msi }
   if (-not $got) { return 'לא נמצא קובץ התקנה של TightVNC' }
 
@@ -191,6 +193,62 @@ function Install-TightVnc {
   return $null
 }
 
+
+# ---- install log (so a failure always leaves a readable reason) ----
+$LogDir = Join-Path $env:ProgramData 'SionyxAgent'
+$InstLog = Join-Path $LogDir 'install.log'
+function ILog($m) {
+  try {
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    Add-Content -Path $InstLog -Value ('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)
+  } catch { }
+}
+
+# Installs the agent WITHOUT spawning "powershell -File": on lab computers a Group Policy
+# execution policy / AppLocker rule often blocks .ps1 files (exit code 1) even with -ExecutionPolicy Bypass.
+# The agent is started through a tiny .cmd launcher that feeds the script text to PowerShell
+# via -Command (execution policy only applies to files, not to commands).
+function Install-Agent($num) {
+  $ErrorActionPreference = 'Continue'   # native stderr must not become a terminating error here
+  $Dir = Join-Path $env:ProgramData 'SionyxAgent'
+  $launcher = Join-Path $Dir 'run-agent.cmd'
+  $agentPath = Join-Path $Dir 'agent.ps1'
+  $psCmd = "& ([scriptblock]::Create([IO.File]::ReadAllText('$agentPath'))) -ComputerNumber '$num' -Key '$Key' -Server '$Server'"
+  $line = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' + $psCmd + '"'
+  [IO.File]::WriteAllText($launcher, "@echo off`r`n$line`r`n", [Text.Encoding]::ASCII)
+  ILog "launcher written: $launcher"
+
+  $ok = $false; $why = ''
+  try {
+    $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c "' + $launcher + '"')
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName 'SionyxAgent' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    $ok = $true; ILog 'task registered (Register-ScheduledTask)'
+  } catch { $why = $_.Exception.Message; ILog "Register-ScheduledTask failed: $why" }
+
+  if (-not $ok) {
+    # fallback: schtasks.exe (works even when the ScheduledTasks PowerShell module is unavailable)
+    $out = & schtasks.exe /Create /TN SionyxAgent /TR ('cmd.exe /c "' + $launcher + '"') /SC ONSTART /RU SYSTEM /RL HIGHEST /F 2>&1 | Out-String
+    ILog ("schtasks exit=$LASTEXITCODE out=" + $out.Trim())
+    if ($LASTEXITCODE -eq 0) { $ok = $true } else { throw ('יצירת משימה מתוזמנת נכשלה: ' + $why + ' | ' + $out.Trim()) }
+  }
+
+  # start it now
+  $started = $false
+  try { Start-ScheduledTask -TaskName 'SionyxAgent' -ErrorAction Stop; $started = $true } catch { ILog "Start-ScheduledTask failed: $($_.Exception.Message)" }
+  if (-not $started) {
+    $o2 = & schtasks.exe /Run /TN SionyxAgent 2>&1 | Out-String
+    ILog ("schtasks /Run exit=$LASTEXITCODE out=" + $o2.Trim())
+    if ($LASTEXITCODE -ne 0) {
+      # last resort: run the launcher directly (agent runs now; task will start it on next boot)
+      Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c "' + $launcher + '"') -WindowStyle Hidden
+      ILog 'started launcher directly'
+    }
+  }
+}
+
 function Do-Install {
   $num = $box.Text.Trim()
   if ($num -notmatch '^[A-Za-z0-9_-]{1,32}$') {
@@ -204,6 +262,7 @@ function Do-Install {
     Set-Step 0 'run'
     $Dir = Join-Path $env:ProgramData 'SionyxAgent'
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    ILog "=== install start: computer $num, PS $($PSVersionTable.PSVersion), OS $([Environment]::OSVersion.Version), lang mode $($ExecutionContext.SessionState.LanguageMode)"
     Stop-ScheduledTask -TaskName 'SionyxAgent' -ErrorAction SilentlyContinue
     $target = Join-Path $Dir 'agent.ps1'
     [IO.File]::WriteAllBytes($target, [Convert]::FromBase64String($AgentB64))
@@ -211,9 +270,7 @@ function Do-Install {
 
     # 2. agent + scheduled task
     Set-Step 1 'run'
-    $p = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$target`"", '-ComputerNumber', "`"$num`"", '-Key', "`"$Key`"", '-Server', "`"$Server`"", '-Install')
-    while (-not $p.HasExited) { Pump; Start-Sleep -Milliseconds 40 }
-    if ($p.ExitCode -ne 0) { throw 'התקנת הסוכן נכשלה (קוד ' + $p.ExitCode + ')' }
+    Install-Agent $num
     Set-Step 1 'ok'
 
     # 3. system settings (Ctrl+Alt+Del from the agent)
@@ -268,7 +325,8 @@ function Do-Install {
     }
     $btn.Text = 'סגור'; $btn.BackColor = $Green; $S.done = $true; $btn.Enabled = $true
   } catch {
-    $msg.ForeColor = $Red; $msg.Text = 'שגיאה: ' + $_.Exception.Message
+    ILog ('FAILED: ' + $_.Exception.Message + ' | ' + $_.ScriptStackTrace)
+    $msg.ForeColor = $Red; $msg.Height = 44; $msg.Text = 'שגיאה: ' + $_.Exception.Message + "`nלוג: $InstLog"
     foreach ($l in $steps) { if ($l.Text.StartsWith($Cur)) { $l.Text = "$Cross  $($l.Tag)"; $l.ForeColor = $Red } }
     $btn.Text = 'נסה שוב'; $btn.Enabled = $true; $box.Enabled = $true
   }

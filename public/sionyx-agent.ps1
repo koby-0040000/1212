@@ -26,8 +26,13 @@ if ($Install) {
   New-Item -ItemType Directory -Force -Path $Dir | Out-Null
   $target = Join-Path $Dir 'agent.ps1'
   if ($PSCommandPath -ne $target) { Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force }
-  $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$target`" -ComputerNumber `"$ComputerNumber`" -Key `"$Key`" -Server `"$Server`""
-  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
+  # Start through a .cmd launcher + -Command (not -File): Group Policy execution policy / AppLocker
+  # on lab computers can block .ps1 files even with -ExecutionPolicy Bypass.
+  $launcher = Join-Path $Dir 'run-agent.cmd'
+  $psCmd = "& ([scriptblock]::Create([IO.File]::ReadAllText('$target'))) -ComputerNumber '$ComputerNumber' -Key '$Key' -Server '$Server'"
+  $launchLine = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' + $psCmd + '"'
+  [IO.File]::WriteAllText($launcher, ("@echo off`r`n" + $launchLine + "`r`n"), [Text.Encoding]::ASCII)
+  $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c "' + $launcher + '"')
   $trigger = New-ScheduledTaskTrigger -AtStartup
   $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries

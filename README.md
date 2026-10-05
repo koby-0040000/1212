@@ -119,3 +119,13 @@ viewer page joins the same room. Nothing else in the relay changed.
   The viewer's "elevated click" and "type text" buttons are not implemented by this agent.
 - Ctrl+Alt+Del uses Windows `SendSAS`; the installer enables the required policy
   (`SoftwareSASGeneration=1`).
+
+### Installer troubleshooting (lab computers)
+
+The installer writes `C:\ProgramData\SionyxAgent\install.log` (PowerShell version, language mode, every step and
+the exact error). If installation fails, open that file first.
+
+The agent is started through `C:\ProgramData\SionyxAgent\run-agent.cmd`, which runs the agent with
+`powershell -Command` instead of `powershell -File`. Reason: Group Policy / AppLocker execution policy on lab
+computers blocks `.ps1` *files* (child process exit code 1) even with `-ExecutionPolicy Bypass`.
+If `Register-ScheduledTask` fails, the installer falls back to `schtasks.exe`.
