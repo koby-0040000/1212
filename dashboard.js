@@ -110,11 +110,13 @@ function cleanSysInfo(si) {
   if (!si || typeof si !== 'object') return null;
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
   const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
-  const procs = Array.isArray(si.processes) ? si.processes.slice(0, 10).map((p) => ({
+  const procs = Array.isArray(si.processes) ? si.processes.slice(0, 12).map((p) => ({
     name: str(p && p.name, 60), pid: num(p && p.pid), pct: num(p && p.pct), memMb: num(p && p.memMb),
+    hint: str(p && p.hint, 80), protected: !!(p && p.protected),
   })).filter((p) => p.name) : [];
   return {
-    cpuModel: str(si.cpuModel, 120), cores: num(si.cores), cpuPct: num(si.cpuPct), processes: procs,
+    cpuModel: str(si.cpuModel, 120), cores: num(si.cores), threads: num(si.threads), maxMhz: num(si.maxMhz),
+    procCount: num(si.procCount), cpuPct: num(si.cpuPct), processes: procs,
   };
 }
 
@@ -141,6 +143,7 @@ const view = (c) => ({
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
   stats: c.stats || null,
   sysinfo: c.sysinfo || null, sysinfoAt: c.sysinfoAt || null,
+  killResult: c.killResult || null, killResultAt: c.killResultAt || null,
 });
 
 // ---- routes ----
@@ -204,6 +207,23 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// End one process on a computer (from the "פרטי מחשב" window). The agent re-checks
+// that PID still belongs to that process name and refuses protected system processes.
+router.post('/computers/:number/kill', requireAuth, (req, res) => {
+  const c = computers.get(req.params.number);
+  if (!c) return res.status(404).json({ error: 'unknown computer' });
+  if (!isOnline(c)) return res.status(409).json({ error: 'offline' });
+  if (!c.stats || Number(c.stats.agent) < 4) return res.status(409).json({ error: 'agent_outdated' });
+  const pid = Number(req.body && req.body.pid);
+  const name = String((req.body && req.body.name) || '');
+  if (!Number.isInteger(pid) || pid <= 4 || pid > 4194304) return res.status(400).json({ error: 'bad pid' });
+  if (!/^[\w .()\-]{1,60}$/.test(name)) return res.status(400).json({ error: 'bad name' });
+  c.kills = (c.kills || []).slice(-4);
+  c.kills.push({ pid, name, at: Date.now() });
+  console.log(`[dash] kill ${name} (${pid}) queued for computer ${c.number}`);
+  res.json({ ok: true });
+});
+
 router.post('/computers/:number/name', requireAuth, (req, res) => {
   const c = computers.get(req.params.number);
   if (!c) return res.status(404).json({ error: 'unknown computer' });
@@ -253,6 +273,11 @@ router.post('/agent/heartbeat', (req, res) => {
   // Get-SysInfo in sionyx-agent.ps1) - most heartbeats won't carry this.
   const si = cleanSysInfo(body.sysinfo);
   if (si) { c.sysinfo = si; c.sysinfoAt = now; }
+  const kr = body.killResult;
+  if (kr && typeof kr === 'object') {
+    c.killResult = { pid: Number(kr.pid) || 0, name: String(kr.name || '').slice(0, 60), ok: !!kr.ok, msg: String(kr.msg || '').slice(0, 120) };
+    c.killResultAt = now;
+  }
 
   let session = null;
   if (c.pending) {
@@ -262,8 +287,10 @@ router.post('/agent/heartbeat', (req, res) => {
   const now2 = Date.now();
   const commands = (c.commands || []).filter((x) => now2 - x.at < COMMAND_TTL_MS).map((x) => x.action);
   c.commands = [];
+  const kills = (c.kills || []).filter((x) => now2 - x.at < COMMAND_TTL_MS).map((x) => ({ pid: x.pid, name: x.name }));
+  c.kills = [];
   scheduleSave();
-  res.json({ session, commands });
+  res.json({ session, commands, kills });
 });
 
 // The agent calls this right before it deletes itself from the computer: the computer is

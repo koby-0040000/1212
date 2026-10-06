@@ -116,8 +116,39 @@ function Run-Command([string]$cmd) {
   } catch { Log "command failed: $($_.Exception.Message)" }
 }
 
+# Processes that must never be ended remotely (system-critical, the VNC server,
+# the desktop shell, and PowerShell - which is what this agent itself runs in).
+$script:ProtectedProcs = @('system','idle','registry','smss','csrss','wininit','winlogon','services','lsass','svchost','dwm','fontdrvhost',
+  'explorer','sihost','taskhostw','ctfmon','conhost','memory compression','securityhealthservice','msmpeng','wmiprvse',
+  'tvnserver','powershell','pwsh','wscript','cscript')
+$script:KillResult = $null
+
+function Kill-Proc($k) {
+  $pidv = 0; $name = ''
+  try { $pidv = [int]$k.pid; $name = [string]$k.name } catch { return }
+  $base = ($name -replace '#\d+$','')
+  $res = @{ pid = $pidv; name = $name; ok = $false; msg = '' }
+  try {
+    if ($pidv -le 4 -or $pidv -eq $PID) { $res.msg = 'protected'; throw 'protected' }
+    if ($script:ProtectedProcs -contains $base.ToLower()) { $res.msg = 'protected'; throw 'protected' }
+    $p = Get-Process -Id $pidv -ErrorAction SilentlyContinue
+    if (-not $p) { $res.msg = 'gone'; $res.ok = $true; throw 'gone' }
+    if ($p.ProcessName -ine $base) { $res.msg = 'mismatch'; throw 'mismatch' }
+    Stop-Process -Id $pidv -Force -ErrorAction Stop
+    Start-Sleep -Milliseconds 400
+    if (Get-Process -Id $pidv -ErrorAction SilentlyContinue) { $res.msg = 'still_running' }
+    else { $res.ok = $true; $res.msg = 'killed' }
+    Log "killed $name ($pidv): $($res.msg)"
+  } catch {
+    if (-not $res.msg) { $res.msg = "error: $($_.Exception.Message)" }
+    Log "kill $name ($pidv) not done: $($res.msg)"
+  }
+  $script:KillResult = $res
+}
+
 function Handle-Reply($r) {
   if ($r -and $r.commands) { foreach ($c in @($r.commands)) { Run-Command ([string]$c) } }
+  if ($r -and $r.kills) { foreach ($k in @($r.kills)) { Kill-Proc $k } }
 }
 
 # Control channel used by the viewer's Ctrl+Alt+Del button (same JSON protocol as the kiosk app).
@@ -142,7 +173,7 @@ function Test-Vnc {
 }
 
 function Get-Stats {
-  $s = @{ agent = '3'; vnc = (Test-Vnc) }
+  $s = @{ agent = '4'; vnc = (Test-Vnc) }
   try {
     $os = Get-CimInstance Win32_OperatingSystem
     $s.os = [string]$os.Caption
@@ -167,38 +198,42 @@ function Get-Stats {
   return $s
 }
 
-# On-demand only (triggered by the dashboard's "פרטי מעבד" button, see the
-# 'sysinfo' command above) - NOT part of the regular heartbeat, since
+# On-demand only (triggered by the dashboard's sysinfo button, see the
+# sysinfo command above) - NOT part of the regular heartbeat, since
 # sampling per-process CPU has a real (if small) cost and most of the time
 # nobody is looking at it. Get-Counter needs ~1s to take a real sample
 # (instantaneous process CPU numbers are meaningless without one), which is
 # fine here since this only runs when explicitly asked for.
 function Get-SysInfo {
   $out = @{ processes = @() }
-  try { $out.cpuModel = [string](Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name) } catch { }
-  try { $out.cores = [Environment]::ProcessorCount } catch { }
+  $threads = [Math]::Max(1, [Environment]::ProcessorCount)
+  $out.threads = $threads
+  try {
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $out.cpuModel = [string]$cpu.Name
+    $out.cores = [int]$cpu.NumberOfCores
+    $out.maxMhz = [int]$cpu.MaxClockSpeed
+  } catch { }
   try { $out.cpuPct = [int](Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average } catch { }
   try {
-    $cores = [Math]::Max(1, [Environment]::ProcessorCount)
-    # One Get-Counter sample (not Get-Process's cumulative CPU-seconds-since-
-    # start, which is useless for "what's loading it RIGHT NOW") gives
-    # %-of-one-core per process; dividing by core count normalizes to
-    # %-of-whole-machine, matching the cpuPct shown elsewhere in the dashboard.
-    $samples = (Get-Counter '\Process(*)\% Processor Time' -ErrorAction Stop).CounterSamples |
-      Where-Object { $_.InstanceName -notin @('_total', 'idle') -and $_.CookedValue -gt 0.5 } |
-      Sort-Object CookedValue -Descending | Select-Object -First 8
-    $out.processes = @($samples | ForEach-Object {
-      $name = $_.InstanceName
-      $mem = $null
-      try {
-        # InstanceName is the process NAME, not PID (several processes can
-        # share one name, e.g. multiple chrome.exe) - sum their memory.
-        $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
-        if ($procs) { $mem = [math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB) }
-      } catch { }
-      @{ name = $name; pct = [math]::Round($_.CookedValue / $cores, 1); memMb = $mem }
+    # Win32_PerfFormattedData gives a real "right now" % per process (+ PID and memory)
+    # in one query. PercentProcessorTime is % of ONE core, so divide by logical CPUs
+    # to get % of the whole machine (matches the overall CPU gauge).
+    $all = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop |
+      Where-Object { $_.Name -notin @('_Total','Idle') })
+    $out.procCount = $all.Count
+    $top = $all | Where-Object { $_.PercentProcessorTime -gt 0 } | Sort-Object PercentProcessorTime -Descending | Select-Object -First 10
+    $out.processes = @($top | ForEach-Object {
+      $disp = ($_.Name -replace '#\d+$','')
+      $low = $disp.ToLower()
+      @{
+        name = $_.Name; pid = [int]$_.IDProcess
+        pct = [math]::Round([double]$_.PercentProcessorTime / $threads, 1)
+        memMb = [math]::Round([double]$_.WorkingSet / 1MB)
+        protected = [bool]($script:ProtectedProcs -contains $low -or [int]$_.IDProcess -le 4 -or [int]$_.IDProcess -eq $PID)
+      }
     })
-  } catch { Log "Get-SysInfo: Get-Counter failed ($($_.Exception.Message)) - processes list will be empty" }
+  } catch { Log "Get-SysInfo: process query failed ($($_.Exception.Message)) - processes list will be empty" }
   return $out
 }
 
@@ -218,6 +253,7 @@ function Beat([bool]$busy) {
     # so we don't keep re-POSTing the same (increasingly stale) snapshot on
     # every heartbeat forever.
     if ($script:SysInfo) { $b.sysinfo = $script:SysInfo; $script:SysInfo = $null }
+    if ($script:KillResult) { $b.killResult = $script:KillResult; $script:KillResult = $null }
     $body = $b | ConvertTo-Json -Compress -Depth 4
     return Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
   } catch { return $null }

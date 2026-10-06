@@ -80,8 +80,9 @@
   .tags { display:flex; flex-wrap:wrap; gap:6px; }
   .tag { font-size:12px; padding:3px 9px; border-radius:8px; background:var(--track); color:var(--text); }
   .tag.ok { background:rgba(22,163,74,.14); color:var(--ok); } .tag.warn { background:rgba(217,119,6,.15); color:var(--busy); }
-  .row { display:flex; gap:6px; margin-top:2px; }
+  .row { display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
   .row .primary { flex:1; }
+  .row .wide { flex:1 1 100%; order:5; font-weight:600; }
   .small { padding:6px 9px; font-size:12px; }
   select.small { border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--text); max-width:120px; cursor:pointer; }
   .empty { grid-column:1/-1; text-align:center; color:var(--muted); padding:70px 10px; line-height:1.9; }
@@ -107,7 +108,7 @@
 
   /* ---------- sysinfo modal ---------- */
   #sysModal { position:fixed; inset:0; background:rgba(10,14,25,.5); z-index:30; display:flex; align-items:center; justify-content:center; padding:16px; }
-  .sysBox { background:var(--card); color:var(--text); border-radius:16px; max-width:480px; width:100%; max-height:80vh; overflow:auto; box-shadow:var(--shadow-hover); animation:rise .3s both; }
+  .sysBox { background:var(--card); color:var(--text); border-radius:16px; max-width:560px; width:100%; max-height:80vh; overflow:auto; box-shadow:var(--shadow-hover); animation:rise .3s both; }
   .sysHead { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--card); }
   .sysHead b { font-size:16px; }
   #sysBody { padding:16px 18px; font-size:14px; }
@@ -119,6 +120,14 @@
   table.sysTbl td { padding:5px 6px; border-bottom:1px solid var(--line); }
   table.sysTbl td.pctCell { font-weight:600; }
   .pctHigh { color:var(--bad); } .pctMed { color:var(--busy); }
+  .sysGrid { display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; margin:0 0 12px; font-size:13px; }
+  .sysGrid div span { color:var(--muted); }
+  .sysInsight { background:rgba(217,119,6,.12); border-radius:10px; padding:9px 11px; margin-bottom:12px; font-size:13px; line-height:1.5; }
+  .sysInsight.ok { background:rgba(22,163,74,.12); }
+  .procHint { display:block; color:var(--muted); font-size:11.5px; }
+  button.kill { padding:3px 9px; font-size:12px; color:var(--bad); border-color:var(--bad); background:transparent; }
+  button.kill:disabled { opacity:.5; }
+  .lockMark { color:var(--muted); font-size:12px; }
 </style>
 </head>
 <body>
@@ -158,7 +167,7 @@
 <div id="sysModal" class="hidden">
   <div class="sysBox">
     <div class="sysHead">
-      <b id="sysTitle">פרטי מעבד</b>
+      <b id="sysTitle">פרטי מחשב</b>
       <button id="sysClose" class="small" type="button">&#10005;</button>
     </div>
     <div id="sysBody"></div>
@@ -235,7 +244,7 @@ function makeCard(c) {
     const o = el('option', null, t); o.value = v; cmd.appendChild(o);
   }
   const del = el('button', 'small', 'הסר'); del.title = 'הסר מהרשימה';
-  const sys = el('button', 'small', 'פרטי מעבד'); sys.title = 'דגם המעבד ומה מעמיס עליו כרגע';
+  const sys = el('button', 'small wide', '\u{1F4CA} פרטי מחשב'); sys.title = 'דגם המעבד, מה מעמיס עליו כרגע, ואפשרות לסיים תהליכים';
   row.append(go, ren, cmd, sys, del);
   card.append(top, sub, seen, note, gauges, tags, row);
   card.addEventListener('animationend', () => card.classList.remove('enter'), { once: true });
@@ -314,6 +323,7 @@ async function refresh() {
     $('sOnline').textContent = r.online; $('sTotal').textContent = r.total; $('sOff').textContent = r.total - r.online;
     render();
     checkSysInfoWatch();
+    checkKillWatch();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
 
@@ -329,21 +339,102 @@ let sysWatch = null; // { number, requestedAt, btn }
 
 function pctClass(pct) { return pct >= 60 ? 'pctHigh' : pct >= 25 ? 'pctMed' : ''; }
 
+const esc = (t) => String(t == null ? '' : t).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+const PROC_HINTS = {
+  msmpeng: 'אנטי-וירוס Windows Defender סורק קבצים', mpdefendercoreservice: 'אנטי-וירוס Windows Defender', mrt: 'כלי הסרת תוכנות זדוניות של Windows',
+  tiworker: 'עדכוני Windows מתקינים', trustedinstaller: 'עדכוני Windows', wuauclt: 'עדכוני Windows', usocoreworker: 'בדיקת עדכוני Windows',
+  searchindexer: 'אינדוקס קבצים (חיפוש Windows)', compattelrunner: 'איסוף נתוני תאימות של Microsoft', wmiprvse: 'ניטור מערכת (WMI)',
+  svchost: 'שירות מערכת של Windows (לעיתים עדכונים/רשת)', system: 'ליבת המערכת (דרייברים/דיסק)', chrome: 'דפדפן Chrome', msedge: 'דפדפן Edge',
+  firefox: 'דפדפן Firefox', tvnserver: 'שרת VNC (השליטה מרחוק)', powershell: 'סקריפט PowerShell (כנראה הסוכן)', onedrive: 'סנכרון OneDrive',
+  teams: 'Microsoft Teams', dwm: 'ציור שולחן העבודה', explorer: 'סייר הקבצים / שולחן העבודה', software_reporter_tool: 'כלי ניקוי של Chrome',
+  wsappx: 'חנות Windows / עדכון אפליקציות', backgroundtaskhost: 'משימת רקע של אפליקציה', officeclicktorun: 'עדכון Office',
+};
+const KILL_MSGS = {
+  killed: 'התהליך הסתיים', gone: 'התהליך כבר לא רץ', mismatch: 'ה-PID שייך עכשיו לתהליך אחר - בוטל',
+  protected: 'תהליך מערכת מוגן - לא ניתן לסיים', still_running: 'הפקודה נשלחה אך התהליך עדיין רץ',
+};
+const baseName = (n) => String(n).replace(/#\d+$/, '');
+const hintFor = (p) => p.hint || PROC_HINTS[baseName(p.name).toLowerCase()] || '';
+
 function renderSysInfo(c) {
-  const si = c.sysinfo;
+  const si = c.sysinfo, st = c.stats || {};
   const body = $('sysBody');
-  $('sysTitle').textContent = 'פרטי מעבד - מחשב ' + c.number;
+  $('sysTitle').textContent = 'פרטי מחשב - מחשב ' + c.number;
   if (!si) { body.innerHTML = '<div class="sysLoading">אין עדיין נתונים ממחשב זה.</div>'; return; }
-  const rows = si.processes.map((p) => `<tr><td>${p.name}</td><td class="pctCell ${pctClass(p.pct)}">${p.pct}%</td><td>${p.memMb ?? '-'} MB</td></tr>`).join('');
+  const ghz = si.maxMhz ? (si.maxMhz / 1000).toFixed(1) + ' GHz' : '-';
+  const ramUsed = st.ramTotalGb != null && st.ramFreeGb != null ? (st.ramTotalGb - st.ramFreeGb).toFixed(1) + ' / ' + st.ramTotalGb + ' GB' : '-';
+  const up = st.uptimeHours != null ? (st.uptimeHours < 1 ? Math.round(st.uptimeHours * 60) + ' דק׳' : st.uptimeHours + ' שעות') : '-';
+  const list = si.processes || [];
+  const sum = list.reduce((a, p) => a + (p.pct || 0), 0);
+  const top = list[0];
+  let insight;
+  if (top && top.pct >= 10) {
+    const h = hintFor(top);
+    insight = `<div class="sysInsight">\u{1F50E} הגורם העיקרי לעומס: <b>${esc(baseName(top.name))}</b> (${top.pct}% מהמעבד)${h ? ' - ' + esc(h) : ''}.${top.protected ? ' זה תהליך מערכת, ולכן אי אפשר לסיים אותו מכאן.' : ' אם זה לא נחוץ אפשר ללחוץ "סיים".'}</div>`;
+  } else if (si.cpuPct != null && si.cpuPct >= 60 && sum < 15) {
+    insight = '<div class="sysInsight">\u{1F50E} העומס הכולל גבוה אבל אף תהליך בודד לא מעמיס. ייתכן עומס רגעי, דרייבר או חומרה. כדאי לדגום שוב בעוד רגע.</div>';
+  } else {
+    insight = '<div class="sysInsight ok">\u2705 אין תהליך שמעמיס על המעבד כרגע.</div>';
+  }
+  const rows = list.map((p) => {
+    const h = hintFor(p);
+    const act = p.protected ? '<span class="lockMark" title="תהליך מערכת מוגן">\u{1F512}</span>'
+      : `<button class="kill" data-pid="${p.pid}" data-name="${esc(p.name)}">סיים</button>`;
+    return `<tr><td>${esc(baseName(p.name))}${h ? `<span class="procHint">${esc(h)}</span>` : ''}</td><td class="pctCell ${pctClass(p.pct)}">${p.pct}%</td><td>${p.memMb ?? '-'} MB</td><td>${act}</td></tr>`;
+  }).join('');
   body.innerHTML = `
-    <div class="sysCpuLine">${si.cpuModel || 'דגם לא זמין'}</div>
-    <div class="sysSub2">${si.cores ? si.cores + ' ליבות · ' : ''}עומס כולל: ${si.cpuPct != null ? si.cpuPct + '%' : '-'}${c.sysinfoAt ? ' · נדגם ' + ago(c.sysinfoAt) : ''}</div>
-    <table class="sysTbl"><tr><th>תהליך</th><th>% מעבד</th><th>זיכרון</th></tr>${rows || '<tr><td colspan="3" style="color:var(--muted)">אין נתוני תהליכים</td></tr>'}</table>`;
+    <div class="sysCpuLine">${esc(si.cpuModel) || 'דגם לא זמין'}</div>
+    <div class="sysSub2">נדגם ${c.sysinfoAt ? ago(c.sysinfoAt) : ''}</div>
+    <div class="sysGrid">
+      <div><span>ליבות / תהליכונים:</span> ${si.cores || '-'} / ${si.threads || '-'}</div>
+      <div><span>מהירות מקסימלית:</span> ${ghz}</div>
+      <div><span>עומס מעבד כולל:</span> <b>${si.cpuPct != null ? si.cpuPct + '%' : '-'}</b></div>
+      <div><span>זיכרון בשימוש:</span> ${ramUsed}</div>
+      <div><span>תהליכים רצים:</span> ${si.procCount ?? '-'}</div>
+      <div><span>זמן פעילות:</span> ${up}</div>
+      <div><span>מערכת הפעלה:</span> ${esc(st.os) || '-'}</div>
+      <div><span>דיסק C: פנוי:</span> ${st.diskFreeGb != null ? st.diskFreeGb + ' GB' : '-'}</div>
+    </div>
+    ${insight}
+    <table class="sysTbl"><tr><th>תהליך</th><th>% מעבד</th><th>זיכרון</th><th></th></tr>${rows || '<tr><td colspan="4" style="color:var(--muted)">אין תהליכים שמעמיסים כרגע</td></tr>'}</table>
+    <div style="margin-top:12px"><button id="sysRefresh" class="small" type="button">\u{1F504} דגום שוב</button></div>`;
+  body.querySelectorAll('button.kill').forEach((b) => { b.onclick = () => killProc(c, b); });
+  const rf = $('sysRefresh'); if (rf) rf.onclick = () => openSysInfo(c, null);
+}
+
+// ---- end a process ----
+let killWatch = null; // { number, requestedAt, name }
+async function killProc(c, btn) {
+  const pid = Number(btn.dataset.pid), name = btn.dataset.name;
+  if (!confirm(`לסיים את התהליך "${baseName(name)}" במחשב ${c.number}?\nעבודה לא שמורה בתוכנה הזו תאבד.`)) return;
+  btn.disabled = true; btn.textContent = 'מסיים...';
+  try {
+    await api(`/computers/${encodeURIComponent(c.number)}/kill`, { method: 'POST', body: { pid, name } });
+    killWatch = { number: c.number, requestedAt: Date.now(), name: baseName(name) };
+    toast('הבקשה נשלחה למחשב, ממתין לאישור...');
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'סיים';
+    toast(e.message === 'agent_outdated' || e.status === 409 ? 'המחשב כבוי או שהסוכן שלו ישן (עדיין לא התעדכן)' : 'שגיאה: ' + e.message, 'err');
+  }
+}
+function checkKillWatch() {
+  if (!killWatch) return;
+  const c = data.find((x) => x.number === killWatch.number);
+  const done = c && c.killResultAt && c.killResultAt >= killWatch.requestedAt;
+  if (!done) {
+    if (Date.now() - killWatch.requestedAt > 30000) { toast('המחשב לא אישר בזמן (ייתכן שהוא בשליטה/עסוק)', 'err'); killWatch = null; }
+    return;
+  }
+  const r = c.killResult || {};
+  const msg = KILL_MSGS[r.msg] || r.msg || (r.ok ? 'בוצע' : 'נכשל');
+  toast(`${killWatch.name}: ${msg}`, r.ok ? undefined : 'err');
+  killWatch = null;
+  if (r.ok && !$('sysModal').classList.contains('hidden')) openSysInfo(c, null); // refresh the list
 }
 
 function openSysInfo(c, btn) {
   $('sysModal').classList.remove('hidden');
-  $('sysTitle').textContent = 'פרטי מעבד - מחשב ' + c.number;
+  $('sysTitle').textContent = 'פרטי מחשב - מחשב ' + c.number;
   $('sysBody').innerHTML = '<div class="sysLoading">מבקש נתונים מהמחשב... (עד כ-15 שניות)</div>';
   sysWatch = { number: c.number, requestedAt: Date.now(), btn };
   if (btn) { btn.disabled = true; btn.textContent = 'מבקש...'; }
@@ -357,7 +448,7 @@ function checkSysInfoWatch() {
   const fresh = c && c.sysinfoAt && c.sysinfoAt >= sysWatch.requestedAt;
   const timedOut = Date.now() - sysWatch.requestedAt > 20000;
   if (!fresh && !timedOut) return; // keep waiting, next refresh() in 5s will check again
-  if (sysWatch.btn) { sysWatch.btn.disabled = !c || !c.online; sysWatch.btn.textContent = 'פרטי מעבד'; }
+  if (sysWatch.btn) { sysWatch.btn.disabled = !c || !c.online; sysWatch.btn.textContent = '\u{1F4CA} פרטי מחשב'; }
   if (!$('sysModal').classList.contains('hidden')) {
     if (fresh) renderSysInfo(c);
     else $('sysBody').innerHTML = '<div class="sysLoading">המחשב לא הגיב בזמן. ייתכן שהוא עסוק או מנותק - אפשר לנסות שוב.</div>';
