@@ -104,6 +104,21 @@
   @keyframes rise { from { opacity:0; transform:translateY(14px) scale(.98); } to { opacity:1; transform:none; } }
   @keyframes float { 0%,100% { transform:translateY(0); } 50% { transform:translateY(-6px); } }
   @media (prefers-reduced-motion: reduce) { * { animation:none !important; transition:none !important; } }
+
+  /* ---------- sysinfo modal ---------- */
+  #sysModal { position:fixed; inset:0; background:rgba(10,14,25,.5); z-index:30; display:flex; align-items:center; justify-content:center; padding:16px; }
+  .sysBox { background:var(--card); color:var(--text); border-radius:16px; max-width:480px; width:100%; max-height:80vh; overflow:auto; box-shadow:var(--shadow-hover); animation:rise .3s both; }
+  .sysHead { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--card); }
+  .sysHead b { font-size:16px; }
+  #sysBody { padding:16px 18px; font-size:14px; }
+  .sysLoading { text-align:center; color:var(--muted); padding:30px 10px; }
+  .sysCpuLine { font-size:15px; font-weight:600; margin-bottom:4px; }
+  .sysSub2 { color:var(--muted); font-size:12.5px; margin-bottom:14px; }
+  table.sysTbl { width:100%; border-collapse:collapse; font-size:13px; }
+  table.sysTbl th { text-align:right; color:var(--muted); font-weight:600; padding:4px 6px; border-bottom:1px solid var(--line); }
+  table.sysTbl td { padding:5px 6px; border-bottom:1px solid var(--line); }
+  table.sysTbl td.pctCell { font-weight:600; }
+  .pctHigh { color:var(--bad); } .pctMed { color:var(--busy); }
 </style>
 </head>
 <body>
@@ -139,6 +154,16 @@
   <main id="grid"></main>
 </div>
 <div id="toasts"></div>
+
+<div id="sysModal" class="hidden">
+  <div class="sysBox">
+    <div class="sysHead">
+      <b id="sysTitle">פרטי מעבד</b>
+      <button id="sysClose" class="small" type="button">&#10005;</button>
+    </div>
+    <div id="sysBody"></div>
+  </div>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -210,14 +235,16 @@ function makeCard(c) {
     const o = el('option', null, t); o.value = v; cmd.appendChild(o);
   }
   const del = el('button', 'small', 'הסר'); del.title = 'הסר מהרשימה';
-  row.append(go, ren, cmd, del);
+  const sys = el('button', 'small', 'פרטי מעבד'); sys.title = 'דגם המעבד ומה מעמיס עליו כרגע';
+  row.append(go, ren, cmd, sys, del);
   card.append(top, sub, seen, note, gauges, tags, row);
   card.addEventListener('animationend', () => card.classList.remove('enter'), { once: true });
-  const entry = { el: card, c, refs: { numTxt, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, del } };
+  const entry = { el: card, c, refs: { numTxt, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, sys, del } };
   go.onclick = () => connect(entry.c, go);
   ren.onclick = () => rename(entry.c);
   del.onclick = () => forget(entry.c);
   cmd.onchange = () => { const v = cmd.value; cmd.value = ''; cmd.blur(); sendCommand(entry.c, v); };
+  sys.onclick = () => openSysInfo(entry.c, sys);
   return entry;
 }
 
@@ -248,6 +275,7 @@ function paint(entry, c) {
   }
   r.go.disabled = !c.online || c.uninstalling;
   r.cmd.disabled = !c.online || c.uninstalling;
+  r.sys.disabled = !c.online || c.uninstalling;
   r.del.style.display = c.online ? 'none' : '';
 }
 
@@ -285,8 +313,60 @@ async function refresh() {
     data = r.computers;
     $('sOnline').textContent = r.online; $('sTotal').textContent = r.total; $('sOff').textContent = r.total - r.online;
     render();
+    checkSysInfoWatch();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
+
+// ---------- "פרטי מעבד" (sysinfo) ----------
+// The agent doesn't have this data lying around - requesting it queues a
+// "sysinfo" command (same queue as restart/shutdown/etc.), the agent picks
+// it up on its next heartbeat (~5s), spends a moment sampling per-process
+// CPU, and reports back on ITS next heartbeat. So this is necessarily a
+// "wait a few seconds" flow, not instant - sysWatch tracks the one computer
+// we're currently waiting on and checkSysInfoWatch() (called after every
+// 5s /computers refresh) notices when the answer has arrived.
+let sysWatch = null; // { number, requestedAt, btn }
+
+function pctClass(pct) { return pct >= 60 ? 'pctHigh' : pct >= 25 ? 'pctMed' : ''; }
+
+function renderSysInfo(c) {
+  const si = c.sysinfo;
+  const body = $('sysBody');
+  $('sysTitle').textContent = 'פרטי מעבד - מחשב ' + c.number;
+  if (!si) { body.innerHTML = '<div class="sysLoading">אין עדיין נתונים ממחשב זה.</div>'; return; }
+  const rows = si.processes.map((p) => `<tr><td>${p.name}</td><td class="pctCell ${pctClass(p.pct)}">${p.pct}%</td><td>${p.memMb ?? '-'} MB</td></tr>`).join('');
+  body.innerHTML = `
+    <div class="sysCpuLine">${si.cpuModel || 'דגם לא זמין'}</div>
+    <div class="sysSub2">${si.cores ? si.cores + ' ליבות · ' : ''}עומס כולל: ${si.cpuPct != null ? si.cpuPct + '%' : '-'}${c.sysinfoAt ? ' · נדגם ' + ago(c.sysinfoAt) : ''}</div>
+    <table class="sysTbl"><tr><th>תהליך</th><th>% מעבד</th><th>זיכרון</th></tr>${rows || '<tr><td colspan="3" style="color:var(--muted)">אין נתוני תהליכים</td></tr>'}</table>`;
+}
+
+function openSysInfo(c, btn) {
+  $('sysModal').classList.remove('hidden');
+  $('sysTitle').textContent = 'פרטי מעבד - מחשב ' + c.number;
+  $('sysBody').innerHTML = '<div class="sysLoading">מבקש נתונים מהמחשב... (עד כ-15 שניות)</div>';
+  sysWatch = { number: c.number, requestedAt: Date.now(), btn };
+  if (btn) { btn.disabled = true; btn.textContent = 'מבקש...'; }
+  api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action: 'sysinfo' } })
+    .catch((e) => { $('sysBody').innerHTML = `<div class="sysLoading">שגיאה: ${e.message}</div>`; sysWatch = null; });
+}
+
+function checkSysInfoWatch() {
+  if (!sysWatch) return;
+  const c = data.find((x) => x.number === sysWatch.number);
+  const fresh = c && c.sysinfoAt && c.sysinfoAt >= sysWatch.requestedAt;
+  const timedOut = Date.now() - sysWatch.requestedAt > 20000;
+  if (!fresh && !timedOut) return; // keep waiting, next refresh() in 5s will check again
+  if (sysWatch.btn) { sysWatch.btn.disabled = !c || !c.online; sysWatch.btn.textContent = 'פרטי מעבד'; }
+  if (!$('sysModal').classList.contains('hidden')) {
+    if (fresh) renderSysInfo(c);
+    else $('sysBody').innerHTML = '<div class="sysLoading">המחשב לא הגיב בזמן. ייתכן שהוא עסוק או מנותק - אפשר לנסות שוב.</div>';
+  }
+  sysWatch = null;
+}
+
+$('sysClose').onclick = () => $('sysModal').classList.add('hidden');
+$('sysModal').addEventListener('click', (e) => { if (e.target.id === 'sysModal') $('sysModal').classList.add('hidden'); });
 
 async function connect(c, btn) {
   const w = window.open('', '_blank'); // opened synchronously so popup blockers allow it

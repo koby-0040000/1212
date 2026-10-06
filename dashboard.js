@@ -30,7 +30,7 @@ const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
-const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall']);
+const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo']);
 const UNINSTALL_ALIVE_MS = 20 * 1000;
 const UNINSTALL_WAIT_MS = 2 * 60 * 1000; // how long the dashboard shows "removing..." before giving up
 const COMMAND_TTL_MS = 60 * 1000; // a queued command the agent does not pick up in time is dropped
@@ -102,6 +102,22 @@ function loginFailed(ip) {
   else a.n += 1;
 }
 
+// Sanitizes the on-demand "sysinfo" payload (CPU model + top processes by
+// load) the agent sends back after a "sysinfo" command, same spirit as
+// cleanStats: cap sizes/lengths, drop anything malformed, never trust the
+// agent's numbers blindly.
+function cleanSysInfo(si) {
+  if (!si || typeof si !== 'object') return null;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
+  const procs = Array.isArray(si.processes) ? si.processes.slice(0, 10).map((p) => ({
+    name: str(p && p.name, 60), pid: num(p && p.pid), pct: num(p && p.pct), memMb: num(p && p.memMb),
+  })).filter((p) => p.name) : [];
+  return {
+    cpuModel: str(si.cpuModel, 120), cores: num(si.cores), cpuPct: num(si.cpuPct), processes: procs,
+  };
+}
+
 function cleanStats(s) {
   if (!s || typeof s !== 'object') return null;
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -124,6 +140,7 @@ const view = (c) => ({
   uninstallFailed: !!c.uninstallAt && !!c.lastSeen && c.lastSeen > c.uninstallAt + UNINSTALL_ALIVE_MS,
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
   stats: c.stats || null,
+  sysinfo: c.sysinfo || null, sysinfoAt: c.sysinfoAt || null,
 });
 
 // ---- routes ----
@@ -232,6 +249,10 @@ router.post('/agent/heartbeat', (req, res) => {
   c.busy = !!body.busy;
   const st = cleanStats(body.stats);
   if (st) c.stats = st;
+  // Only present when the agent just answered a "sysinfo" command (see
+  // Get-SysInfo in sionyx-agent.ps1) - most heartbeats won't carry this.
+  const si = cleanSysInfo(body.sysinfo);
+  if (si) { c.sysinfo = si; c.sysinfoAt = now; }
 
   let session = null;
   if (c.pending) {

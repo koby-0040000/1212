@@ -110,6 +110,7 @@ function Run-Command([string]$cmd) {
       'restart'  { & shutdown.exe /r /t 5 /f }
       'shutdown' { & shutdown.exe /s /t 5 /f }
       'uninstall' { Start-Uninstall }
+      'sysinfo'  { $script:SysInfo = Get-SysInfo }
       default    { Log "unknown command ignored: $cmd" }
     }
   } catch { Log "command failed: $($_.Exception.Message)" }
@@ -166,6 +167,41 @@ function Get-Stats {
   return $s
 }
 
+# On-demand only (triggered by the dashboard's "פרטי מעבד" button, see the
+# 'sysinfo' command above) - NOT part of the regular heartbeat, since
+# sampling per-process CPU has a real (if small) cost and most of the time
+# nobody is looking at it. Get-Counter needs ~1s to take a real sample
+# (instantaneous process CPU numbers are meaningless without one), which is
+# fine here since this only runs when explicitly asked for.
+function Get-SysInfo {
+  $out = @{ processes = @() }
+  try { $out.cpuModel = [string](Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name) } catch { }
+  try { $out.cores = [Environment]::ProcessorCount } catch { }
+  try { $out.cpuPct = [int](Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average } catch { }
+  try {
+    $cores = [Math]::Max(1, [Environment]::ProcessorCount)
+    # One Get-Counter sample (not Get-Process's cumulative CPU-seconds-since-
+    # start, which is useless for "what's loading it RIGHT NOW") gives
+    # %-of-one-core per process; dividing by core count normalizes to
+    # %-of-whole-machine, matching the cpuPct shown elsewhere in the dashboard.
+    $samples = (Get-Counter '\Process(*)\% Processor Time' -ErrorAction Stop).CounterSamples |
+      Where-Object { $_.InstanceName -notin @('_total', 'idle') -and $_.CookedValue -gt 0.5 } |
+      Sort-Object CookedValue -Descending | Select-Object -First 8
+    $out.processes = @($samples | ForEach-Object {
+      $name = $_.InstanceName
+      $mem = $null
+      try {
+        # InstanceName is the process NAME, not PID (several processes can
+        # share one name, e.g. multiple chrome.exe) - sum their memory.
+        $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+        if ($procs) { $mem = [math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB) }
+      } catch { }
+      @{ name = $name; pct = [math]::Round($_.CookedValue / $cores, 1); memMb = $mem }
+    })
+  } catch { Log "Get-SysInfo: Get-Counter failed ($($_.Exception.Message)) - processes list will be empty" }
+  return $out
+}
+
 $script:Stats = $null
 $script:StatsAt = [datetime]::MinValue
 function Refresh-Stats {
@@ -177,7 +213,12 @@ function Refresh-Stats {
 
 function Beat([bool]$busy) {
   try {
-    $body = @{ number = $ComputerNumber; hostname = $env:COMPUTERNAME; busy = $busy; stats = $script:Stats } | ConvertTo-Json -Compress -Depth 3
+    $b = @{ number = $ComputerNumber; hostname = $env:COMPUTERNAME; busy = $busy; stats = $script:Stats }
+    # Sent once, right after a 'sysinfo' command was answered - then cleared,
+    # so we don't keep re-POSTing the same (increasingly stale) snapshot on
+    # every heartbeat forever.
+    if ($script:SysInfo) { $b.sysinfo = $script:SysInfo; $script:SysInfo = $null }
+    $body = $b | ConvertTo-Json -Compress -Depth 4
     return Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
   } catch { return $null }
 }
