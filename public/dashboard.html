@@ -127,6 +127,13 @@
   .procHint { display:block; color:var(--muted); font-size:11.5px; }
   button.kill { padding:3px 9px; font-size:12px; color:var(--bad); border-color:var(--bad); background:transparent; }
   button.kill:disabled { opacity:.5; }
+  .waitBox { text-align:center; padding:18px 8px 8px; }
+  .waitSpin { width:46px; height:46px; margin:0 auto 12px; border-radius:50%; border:4px solid var(--track); border-top-color:var(--accent); animation:spin .9s linear infinite; }
+  .waitStep { font-weight:600; font-size:15px; margin-bottom:10px; }
+  .waitBar { height:8px; border-radius:99px; background:var(--track); overflow:hidden; margin:0 10px 6px; }
+  .waitBar i { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--accent),var(--accent2)); transition:width .9s linear; }
+  .waitSec { color:var(--muted); font-size:12px; margin-bottom:16px; }
+  .waitFact { background:var(--track); border-radius:12px; padding:11px 13px; font-size:13.5px; line-height:1.55; min-height:44px; transition:opacity .3s; }
   .lockMark { color:var(--muted); font-size:12px; }
 </style>
 </head>
@@ -432,32 +439,80 @@ function checkKillWatch() {
   if (r.ok && !$('sysModal').classList.contains('hidden')) openSysInfo(c, null); // refresh the list
 }
 
+const WAIT_STEPS = ['שולח בקשה למחשב...', 'המחשב קולט את הבקשה...', 'דוגם את המעבד ואת התהליכים...', 'אורז את התוצאות...', 'עוד רגע, המחשב עסוק קצת...'];
+const WAIT_FACTS = [
+  '\u{1F9E0} המעבד המסחרי הראשון, Intel 4004 מ-1971, הכיל כ-2,300 טרנזיסטורים. מעבד מודרני מכיל מיליארדים.',
+  '\u26A1 מעבד של 3 GHz מבצע כ-3 מיליארד מחזורי שעון בכל שנייה.',
+  '\u{1F6E1}\uFE0F מחשב "סרק" יכול להראות עומס גבוה כמה דקות אחרי הפעלה: האנטי-וירוס ועדכוני Windows עובדים ברקע.',
+  '\u{1F4A1} הקיצור Ctrl+Shift+Esc פותח את מנהל המשימות ישירות, בלי תפריטים.',
+  '\u{1F4BE} במחשבים ישנים, דיסק קשיח איטי גורם לעיתים לתחושת "עומס" יותר מהמעבד עצמו. מעבר ל-SSD משנה הרבה.',
+  '\u{1F310} כל לשונית פתוחה בדפדפן יכולה לצרוך מאות מגה-בייט. הרבה לשוניות ישנות מעמיסות על הזיכרון.',
+  '\u{1F9EE} אחוז המעבד במחשב מחולק בין כל הליבות: תהליך שממלא ליבה אחת מתוך ארבע מציג כ-25% בלבד.',
+  '\u{1F504} הרבה בעיות איטיות נפתרות באתחול: הוא מנקה תהליכים תקועים וגם משלים עדכונים שמחכים.',
+];
+let sysLoad = null; // { t0, timer, factTimer }
+function stopSysLoad() { if (sysLoad) { clearInterval(sysLoad.timer); clearInterval(sysLoad.factTimer); sysLoad = null; } }
+const SYS_WAIT_MS = 45000;
+
+function startSysLoad() {
+  stopSysLoad();
+  const body = $('sysBody');
+  body.innerHTML = `<div class="waitBox"><div class="waitSpin"></div><div class="waitStep" id="wStep"></div>
+    <div class="waitBar"><i id="wBar"></i></div><div class="waitSec" id="wSec"></div>
+    <div class="waitFact" id="wFact"></div></div>`;
+  const t0 = Date.now();
+  let fi = Math.floor(Math.random() * WAIT_FACTS.length);
+  $('wFact').textContent = WAIT_FACTS[fi];
+  const tick = () => {
+    const el_ = Date.now() - t0, sec = Math.floor(el_ / 1000);
+    const step = $('wStep'); if (!step) return stopSysLoad();
+    step.textContent = WAIT_STEPS[Math.min(WAIT_STEPS.length - 1, Math.floor(sec / 6))];
+    $('wBar').style.width = Math.min(95, el_ / SYS_WAIT_MS * 100) + '%';
+    $('wSec').textContent = 'עברו ' + sec + ' שניות';
+  };
+  tick();
+  sysLoad = {
+    t0, timer: setInterval(tick, 1000),
+    factTimer: setInterval(() => {
+      const f = $('wFact'); if (!f) return;
+      fi = (fi + 1) % WAIT_FACTS.length; f.style.opacity = 0;
+      setTimeout(() => { f.textContent = WAIT_FACTS[fi]; f.style.opacity = 1; }, 300);
+    }, 5000),
+  };
+}
+
 function openSysInfo(c, btn) {
   $('sysModal').classList.remove('hidden');
   $('sysTitle').textContent = 'פרטי מחשב - מחשב ' + c.number;
-  $('sysBody').innerHTML = '<div class="sysLoading">מבקש נתונים מהמחשב... (עד כ-15 שניות)</div>';
+  startSysLoad();
   sysWatch = { number: c.number, requestedAt: Date.now(), btn };
   if (btn) { btn.disabled = true; btn.textContent = 'מבקש...'; }
   api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action: 'sysinfo' } })
-    .catch((e) => { $('sysBody').innerHTML = `<div class="sysLoading">שגיאה: ${e.message}</div>`; sysWatch = null; });
+    .catch((e) => { stopSysLoad(); $('sysBody').innerHTML = `<div class="sysLoading">שגיאה: ${esc(e.message)}</div>`; sysWatch = null; if (btn) { btn.disabled = false; btn.textContent = '\u{1F4CA} פרטי מחשב'; } });
 }
 
 function checkSysInfoWatch() {
   if (!sysWatch) return;
   const c = data.find((x) => x.number === sysWatch.number);
   const fresh = c && c.sysinfoAt && c.sysinfoAt >= sysWatch.requestedAt;
-  const timedOut = Date.now() - sysWatch.requestedAt > 20000;
+  const timedOut = Date.now() - sysWatch.requestedAt > SYS_WAIT_MS;
   if (!fresh && !timedOut) return; // keep waiting, next refresh() in 5s will check again
+  stopSysLoad();
   if (sysWatch.btn) { sysWatch.btn.disabled = !c || !c.online; sysWatch.btn.textContent = '\u{1F4CA} פרטי מחשב'; }
   if (!$('sysModal').classList.contains('hidden')) {
     if (fresh) renderSysInfo(c);
-    else $('sysBody').innerHTML = '<div class="sysLoading">המחשב לא הגיב בזמן. ייתכן שהוא עסוק או מנותק - אפשר לנסות שוב.</div>';
+    else {
+      const old = c && c.stats && Number(c.stats.agent) < 4;
+      $('sysBody').innerHTML = old
+        ? '<div class="sysLoading">המחשב הזה עדיין לא התעדכן לגרסת הסוכן החדשה. העדכון מגיע לבד תוך כ-10 דקות מרגע שהמחשב דלוק ומחובר. אפשר לנסות שוב בעוד כמה דקות.</div>'
+        : '<div class="sysLoading">המחשב לא הגיב בזמן. ייתכן שהוא עמוס מאוד, בשליטה (VNC) או מנותק. אפשר לנסות שוב.</div>';
+    }
   }
   sysWatch = null;
 }
 
-$('sysClose').onclick = () => $('sysModal').classList.add('hidden');
-$('sysModal').addEventListener('click', (e) => { if (e.target.id === 'sysModal') $('sysModal').classList.add('hidden'); });
+$('sysClose').onclick = () => { stopSysLoad(); $('sysModal').classList.add('hidden'); };
+$('sysModal').addEventListener('click', (e) => { if (e.target.id === 'sysModal') { stopSysLoad(); $('sysModal').classList.add('hidden'); } });
 
 async function connect(c, btn) {
   const w = window.open('', '_blank'); // opened synchronously so popup blockers allow it
