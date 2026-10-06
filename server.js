@@ -905,5 +905,90 @@ setInterval(() => {
   for (const [token, room] of rooms) cleanupIfEmpty(token, room);
 }, 60000).unref();
 
+// ---------------------------------------------------------------------------
+// /api/relay-rooms - live snapshot of every active room, for the
+// /relay-stats.html page. No per-event logging needed: this answers "is a
+// specific session slow and where" (agent side? viewer side? big backlog?)
+// at the moment you look, which is what you'd otherwise have to reconstruct
+// from a wall of console.log lines. Protected by the same password used for
+// /dashboard (?key=... since this is meant to be pasted into a browser tab,
+// not called from a script). Tokens are never exposed, only the same short
+// label the logs already use.
+app.get('/api/relay-rooms', (req, res) => {
+  const pw = process.env.DASHBOARD_PASSWORD || '';
+  if (!pw) return res.status(503).json({ error: 'DASHBOARD_PASSWORD is not set on the server' });
+  if (!crypto.timingSafeEqual(
+    crypto.createHash('sha256').update(String(req.query.key || '')).digest(),
+    crypto.createHash('sha256').update(pw).digest(),
+  )) return res.status(401).json({ error: 'unauthorized' });
+
+  const now = Date.now();
+  const roomsOut = [];
+  for (const [token, room] of rooms) {
+    const roleInfo = {};
+    for (const role of ROLES) {
+      const ws = room[role];
+      const httpAge = room.httpSeen[role] ? now - room.httpSeen[role] : null;
+      roleInfo[role] = {
+        connected: !!ws || (httpAge !== null && httpAge < HTTP_ACTIVE_WINDOW_MS),
+        transport: ws ? 'ws' : (httpAge !== null && httpAge < HTTP_ACTIVE_WINDOW_MS ? 'http' : null),
+        lastActiveMsAgo: httpAge,
+        pendingBytes: backlogBytes(room, role),
+        closed: !!room.peerClosed[role],
+      };
+    }
+    roomsOut.push({ room: roomLabel(token), ...roleInfo });
+  }
+  res.json({ serverTime: now, uptimeSeconds: Math.round(process.uptime()), activeRooms: roomsOut.length, rooms: roomsOut });
+});
+
+app.get('/relay-stats.html', (_req, res) => {
+  res.type('html').send(`<!DOCTYPE html><html dir="ltr"><meta charset="utf-8">
+<title>Relay stats</title>
+<style>
+body{font:14px/1.4 Consolas,monospace;background:#111;color:#ddd;padding:16px}
+input{background:#222;color:#ddd;border:1px solid #444;padding:4px 8px}
+table{border-collapse:collapse;margin-top:12px;width:100%}
+td,th{border:1px solid #333;padding:4px 8px;text-align:left;font-size:12px}
+th{background:#222}
+.ok{color:#8f8}.warn{color:#fd6}.bad{color:#f66}.off{color:#666}
+</style>
+<div>DASHBOARD_PASSWORD: <input id="key" type="password"> <button onclick="go()">Connect</button>
+<span id="status"></span></div>
+<div id="out"></div>
+<script>
+let key = localStorage.getItem('relayStatsKey') || '';
+document.getElementById('key').value = key;
+function go() {
+  key = document.getElementById('key').value;
+  localStorage.setItem('relayStatsKey', key);
+  tick();
+}
+async function tick() {
+  if (!key) return;
+  try {
+    const r = await fetch('/api/relay-rooms?key=' + encodeURIComponent(key), { cache: 'no-store' });
+    if (!r.ok) { document.getElementById('status').textContent = ' ' + r.status + ' ' + (await r.json()).error; return; }
+    const d = await r.json();
+    document.getElementById('status').textContent = ' uptime=' + d.uptimeSeconds + 's  activeRooms=' + d.activeRooms;
+    let html = '<table><tr><th>room</th><th>role</th><th>transport</th><th>last active</th><th>pending bytes</th><th>closed</th></tr>';
+    for (const room of d.rooms) {
+      for (const role of ['agent','viewer','controlAgent','controlViewer']) {
+        const ri = room[role];
+        const age = ri.lastActiveMsAgo == null ? '-' : ri.lastActiveMsAgo + 'ms';
+        const cls = !ri.connected ? 'off' : (ri.pendingBytes > 50000 ? 'bad' : ri.pendingBytes > 5000 ? 'warn' : 'ok');
+        html += '<tr class="' + cls + '"><td>' + room.room + '</td><td>' + role + '</td><td>' + (ri.transport||'-') + '</td><td>' + age + '</td><td>' + ri.pendingBytes + '</td><td>' + ri.closed + '</td></tr>';
+      }
+    }
+    html += '</table>';
+    document.getElementById('out').innerHTML = html;
+  } catch (e) { document.getElementById('status').textContent = ' error: ' + e.message; }
+}
+if (key) tick();
+setInterval(tick, 1500);
+</script>
+</html>`);
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`[relay] ${ts()} listening on ${PORT} (node ${process.version}, pid ${process.pid})`));
