@@ -249,6 +249,7 @@ function Reap-BeatPending {
 }
 
 function Beat-Async([bool]$busy) {
+  Apply-LiveStats
   Reap-BeatPending  # cheap (just .IsCompleted checks) - keeps the list from growing all session
   try {
     $body = @{ number = $ComputerNumber; hostname = $env:COMPUTERNAME; busy = $busy; stats = $script:Stats } | ConvertTo-Json -Compress -Depth 3
@@ -261,6 +262,42 @@ function Beat-Async([bool]$busy) {
     $handle = $ps.BeginInvoke()
     [void]$script:BeatPending.Add(@{ Ps = $ps; Handle = $handle })
   } catch { }
+}
+
+# Live stats during a VNC session. Refresh-Stats only runs in the main loop,
+# which is NOT executed while Run-Session is active - so the CPU/RAM numbers
+# used to freeze at whatever they were when the session began (e.g. 91%) and
+# were re-sent unchanged for the whole session. This samples them in a
+# background runspace (so the VNC pump is never blocked by slow CIM queries)
+# and Beat-Async merges the fresh values into $script:Stats before sending.
+$script:LiveStats = [hashtable]::Synchronized(@{})
+$script:LiveStatsJob = $null
+function Start-LiveStatsRefresh {
+  if ($script:LiveStatsJob) {
+    if (-not $script:LiveStatsJob.Handle.IsCompleted) { return }
+    try { $script:LiveStatsJob.Ps.EndInvoke($script:LiveStatsJob.Handle) | Out-Null } catch { }
+    $script:LiveStatsJob.Ps.Dispose()
+    $script:LiveStatsJob = $null
+  }
+  try {
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $script:BeatRunspacePool
+    [void]$ps.AddScript({
+      param($Shared)
+      try { $Shared.cpuPct = [int](Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average } catch { }
+      try {
+        $os = Get-CimInstance Win32_OperatingSystem
+        $Shared.ramFreeGb = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+        $Shared.uptimeHours = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 1)
+      } catch { }
+    }).AddArgument($script:LiveStats)
+    $script:LiveStatsJob = @{ Ps = $ps; Handle = $ps.BeginInvoke() }
+  } catch { }
+}
+
+function Apply-LiveStats {
+  if (-not $script:Stats) { return }
+  foreach ($k in @($script:LiveStats.Keys)) { $script:Stats[$k] = $script:LiveStats[$k] }
 }
 
 function Run-Session([string]$Token) {
@@ -319,7 +356,7 @@ function Run-Session([string]$Token) {
         } catch { }
       }
       if (((Get-Date) - $lastCtl).TotalMilliseconds -ge 500) { Poll-Control $Token; $lastCtl = Get-Date }
-      if (((Get-Date) - $lastBeat).TotalSeconds -ge 4) { Beat-Async $true; $lastBeat = Get-Date }
+      if (((Get-Date) - $lastBeat).TotalSeconds -ge 4) { Start-LiveStatsRefresh; Beat-Async $true; $lastBeat = Get-Date }
       if ($rx -eq 0 -and ((Get-Date) - $started).TotalSeconds -gt 120) { Log 'viewer never joined, giving up'; break }
       if (((Get-Date) - $started).TotalHours -gt 6) { Log 'max session length reached'; break }
       Start-Sleep -Milliseconds 10
