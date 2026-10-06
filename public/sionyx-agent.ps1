@@ -182,6 +182,46 @@ function Beat([bool]$busy) {
   } catch { return $null }
 }
 
+# Fire-and-forget heartbeat for use INSIDE an active VNC session: the normal
+# Beat() above blocks until the HTTP call completes, which used to freeze the
+# entire VNC pump loop (mouse/screen bytes included) for however long that
+# request took - every 4 seconds, for the whole session. This version hands
+# the POST to a background runspace and returns immediately, so a slow/
+# NetFree-inspected heartbeat request no longer stalls VNC responsiveness.
+# Trade-off: command replies (restart/shutdown/etc.) are not read from this
+# call's response, so a command sent while a VNC session is active may wait
+# up to one heartbeat cycle - acceptable, since the admin is already watching
+# the screen live via VNC at that point.
+$script:BeatRunspacePool = [runspacefactory]::CreateRunspacePool(1, 2)
+$script:BeatRunspacePool.Open()
+$script:BeatPending = New-Object System.Collections.ArrayList
+
+function Reap-BeatPending {
+  for ($i = $script:BeatPending.Count - 1; $i -ge 0; $i--) {
+    $entry = $script:BeatPending[$i]
+    if ($entry.Handle.IsCompleted) {
+      try { $entry.Ps.EndInvoke($entry.Handle) | Out-Null } catch { }
+      $entry.Ps.Dispose()
+      $script:BeatPending.RemoveAt($i)
+    }
+  }
+}
+
+function Beat-Async([bool]$busy) {
+  Reap-BeatPending  # cheap (just .IsCompleted checks) - keeps the list from growing all session
+  try {
+    $body = @{ number = $ComputerNumber; hostname = $env:COMPUTERNAME; busy = $busy; stats = $script:Stats } | ConvertTo-Json -Compress -Depth 3
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $script:BeatRunspacePool
+    [void]$ps.AddScript({
+      param($Uri, $Hdrs, $Body)
+      try { Invoke-RestMethod -Method Post -Uri $Uri -Headers $Hdrs -ContentType 'application/json' -Body $Body -UseBasicParsing -TimeoutSec 30 | Out-Null } catch { }
+    }).AddArgument("$Server/api/agent/heartbeat").AddArgument($Headers).AddArgument($body)
+    $handle = $ps.BeginInvoke()
+    [void]$script:BeatPending.Add(@{ Ps = $ps; Handle = $handle })
+  } catch { }
+}
+
 function Run-Session([string]$Token) {
   Log "session start (token $($Token.Substring(0,6))...)"
   $Base = "$Server/rt/agent/$Token"
@@ -192,24 +232,38 @@ function Run-Session([string]$Token) {
     $buf = New-Object byte[] 16384
     $tx = 0; $rx = 0
     $started = Get-Date; $lastBeat = Get-Date; $lastPoll = [Diagnostics.Stopwatch]::StartNew(); $lastCtl = Get-Date
+    $MaxBatchBytes = 1MB  # same cap as the browser/C# transports, see relay-transport.js
     while ($true) {
       if (-not $tcp.Connected) { Log 'TightVNC closed the connection'; break }
-      while ($stream.DataAvailable) {
-        $n = $stream.Read($buf, 0, $buf.Length)
-        if ($n -le 0) { break }
-        $chunk = New-Object byte[] $n; [Array]::Copy($buf, $chunk, $n)
-        $sent = $false
-        for ($try = 1; $try -le 6 -and -not $sent; $try++) {
-          try {
-            Invoke-WebRequest -Method Post -Uri "$Base/send?off=$tx" -Body $chunk -ContentType 'application/octet-stream' -UseBasicParsing -TimeoutSec 30 | Out-Null
-            $sent = $true
-          } catch {
-            if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 409) { break }
-            Start-Sleep -Milliseconds (150 * $try)
-          }
+      if ($stream.DataAvailable) {
+        # Drain everything TightVNC has ready right now into ONE buffer
+        # instead of POSTing each individual Read() as its own HTTP request.
+        # A single screen update from TightVNC often arrives as several back-
+        # to-back TCP reads; sending each as its own blocking HTTP round trip
+        # (as this used to do) serialized their network latency - on a slow
+        # or NetFree-inspected connection that alone could add up to seconds
+        # for one update. One POST per burst fixes that.
+        $ms = New-Object System.IO.MemoryStream
+        while ($stream.DataAvailable -and $ms.Length -lt $MaxBatchBytes) {
+          $n = $stream.Read($buf, 0, $buf.Length)
+          if ($n -le 0) { break }
+          $ms.Write($buf, 0, $n)
         }
-        if (-not $sent) { throw 'send failed, stream desynced' }
-        $tx += $n
+        $chunk = $ms.ToArray()
+        if ($chunk.Length -gt 0) {
+          $sent = $false
+          for ($try = 1; $try -le 6 -and -not $sent; $try++) {
+            try {
+              Invoke-WebRequest -Method Post -Uri "$Base/send?off=$tx" -Body $chunk -ContentType 'application/octet-stream' -UseBasicParsing -TimeoutSec 30 | Out-Null
+              $sent = $true
+            } catch {
+              if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 409) { break }
+              Start-Sleep -Milliseconds (150 * $try)
+            }
+          }
+          if (-not $sent) { throw 'send failed, stream desynced' }
+          $tx += $chunk.Length
+        }
       }
       if ($lastPoll.ElapsedMilliseconds -ge 100) {
         $lastPoll.Restart()
@@ -224,7 +278,7 @@ function Run-Session([string]$Token) {
         } catch { }
       }
       if (((Get-Date) - $lastCtl).TotalMilliseconds -ge 500) { Poll-Control $Token; $lastCtl = Get-Date }
-      if (((Get-Date) - $lastBeat).TotalSeconds -ge 4) { Handle-Reply (Beat $true); $lastBeat = Get-Date }
+      if (((Get-Date) - $lastBeat).TotalSeconds -ge 4) { Beat-Async $true; $lastBeat = Get-Date }
       if ($rx -eq 0 -and ((Get-Date) - $started).TotalSeconds -gt 120) { Log 'viewer never joined, giving up'; break }
       if (((Get-Date) - $started).TotalHours -gt 6) { Log 'max session length reached'; break }
       Start-Sleep -Milliseconds 10
@@ -235,8 +289,33 @@ function Run-Session([string]$Token) {
     if ($tcp) { $tcp.Close() }
     try { Invoke-RestMethod -Method Post -Uri "$Base/close" -UseBasicParsing -TimeoutSec 10 | Out-Null } catch { }
     try { Invoke-RestMethod -Method Post -Uri "$Server/rt/controlAgent/$Token/close" -UseBasicParsing -TimeoutSec 10 | Out-Null } catch { }
+    Reap-BeatPending
     Log 'session end'
   }
+}
+
+# Self-update: every ~10 minutes (only between sessions, never mid-VNC-call),
+# re-download this same script from the server and compare it byte-for-byte
+# against the copy installed at $target. If it changed, overwrite the
+# installed copy and exit - the scheduled task's own restart policy
+# (RestartCount 999 / RestartInterval 1 min, set up in -Install above)
+# relaunches it within a minute, and the launcher re-reads agent.ps1 from
+# disk on every launch, so the new code just takes over. This means a future
+# fix only needs a push to GitHub + a Render deploy, the same one-shot
+# process already used for server.js - no more visiting every kiosk by hand.
+$script:AgentFile = Join-Path $Dir 'agent.ps1'
+$script:LastUpdateCheck = Get-Date
+function Check-ForUpdate {
+  try {
+    $latest = Invoke-RestMethod -Method Get -Uri "$Server/sionyx-agent.ps1" -UseBasicParsing -TimeoutSec 20
+    $current = ''
+    if (Test-Path $script:AgentFile) { $current = [IO.File]::ReadAllText($script:AgentFile) }
+    if ($latest -and $latest -ne $current) {
+      Log 'new agent version found on the server - updating and restarting'
+      [IO.File]::WriteAllText($script:AgentFile, $latest)
+      exit 0   # scheduled task restarts us automatically with the new file
+    }
+  } catch { Log "update check failed: $($_.Exception.Message)" }
 }
 
 Log "agent started: computer $ComputerNumber -> $Server"
@@ -245,5 +324,9 @@ while ($true) {
   $r = Beat $false
   Handle-Reply $r
   if ($r -and $r.session) { Run-Session ([string]$r.session) }
+  if (((Get-Date) - $script:LastUpdateCheck).TotalMinutes -ge 10) {
+    Check-ForUpdate
+    $script:LastUpdateCheck = Get-Date
+  }
   Start-Sleep -Seconds 5
 }
