@@ -298,7 +298,7 @@ async function httpChannel(role, token) {
           } catch (e) {
             if (closed) return;
             if (++attempt >= 4) { fatal(`send failed: ${e.message}`); return; }
-            await new Promise((res) => setTimeout(res, 300 * attempt));
+            await new Promise((res) => setTimeout(res, 150 * attempt));
           }
         }
       }
@@ -410,7 +410,12 @@ async function httpChannel(role, token) {
       } catch (e) {
         if (closed) return;
         if (++failures >= HTTP_MAX_FAILURES) { fatal(`recv failed repeatedly: ${e.message}`); return; }
-        await new Promise((res) => setTimeout(res, streamMode ? Math.min(500, 100 * failures) : Math.min(2000, 300 * failures)));
+        // Shorter backoff than before: a single dropped poll used to cost up
+        // to 2s extra before the next request even went out, which is most of
+        // the "2-3s before anything moves" lag users reported. The relay's
+        // own long-poll (wait=20000) already throttles request volume, so a
+        // quick retry here doesn't add meaningful load.
+        await new Promise((res) => setTimeout(res, streamMode ? Math.min(200, 50 * failures) : Math.min(500, 150 * failures)));
       } finally {
         clearTimeout(timer);
       }

@@ -44,8 +44,8 @@
   <div class="sep"></div>
   <span style="color:#aaa; font-size:12px;">מהירות:</span>
   <select id="qualitySel" title="איכות/מהירות התמונה">
-    <option value="fast">מהיר (איכות נמוכה)</option>
-    <option value="balanced" selected>מאוזן</option>
+    <option value="fast" selected>מהיר (איכות נמוכה)</option>
+    <option value="balanced">מאוזן</option>
     <option value="quality">איכות גבוהה (איטי יותר)</option>
   </select>
   <div class="sep"></div>
@@ -107,7 +107,13 @@
       rfb.qualityLevel = p.quality;
       rfb.compressionLevel = p.compression;
     }
-    applyQuality('balanced');
+    // Default to "fast": on the HTTP long-poll fallback every frame is capped
+    // at RECV_MAX_BYTES (16 000 bytes, see server.js) before NetFree starts
+    // truncating responses, so a smaller/more-compressed frame needs fewer
+    // chunks - i.e. fewer relay round trips - to arrive in full. That's the
+    // single biggest lever we have over perceived speed without touching the
+    // Render plan. Users can still switch to "balanced"/"quality" above.
+    applyQuality('fast');
     document.getElementById('qualitySel').addEventListener('change', (e) => {
       applyQuality(e.target.value);
     });
