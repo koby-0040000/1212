@@ -55,6 +55,8 @@
   <button id="btnTypeText" title="מקליד את הטקסט שלמעלה בקיוסק ולוחץ Enter.">הקלד</button>
   <div class="sep"></div>
   <button id="btnFullscreen" title="מסך מלא">מסך מלא</button>
+  <div class="sep"></div>
+  <span id="latencyBadge" style="color:#8f8; font-size:12px; font-family:Consolas,monospace;" title="זמן תגובה ממוצע של כל קליק/פעולה (מילישניות) - מספר נמוך יותר = מהיר יותר. שמור את זה פתוח לפני ואחרי שינוי כדי להשוות בפועל.">זמן תגובה: --</span>
 </div>
 
 <script type="module">
@@ -114,6 +116,19 @@
     // single biggest lever we have over perceived speed without touching the
     // Render plan. Users can still switch to "balanced"/"quality" above.
     applyQuality('fast');
+
+    // Live round-trip readout, updated from relay-transport.js's rolling
+    // average (window.__relayLatency). Lets you actually SEE whether a
+    // change helped instead of judging by feel - leave this tab open before
+    // and after a deploy and compare the number.
+    const latencyEl = document.getElementById('latencyBadge');
+    setInterval(() => {
+      const L = window.__relayLatency;
+      if (L && L.avgMs != null) {
+        latencyEl.textContent = `זמן תגובה: ${Math.round(L.avgMs)}ms (אחרון: ${Math.round(L.lastMs)}ms)`;
+        latencyEl.style.color = L.avgMs < 400 ? '#8f8' : L.avgMs < 1200 ? '#fd6' : '#f66';
+      }
+    }, 500);
     document.getElementById('qualitySel').addEventListener('change', (e) => {
       applyQuality(e.target.value);
     });

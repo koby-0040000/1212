@@ -262,6 +262,12 @@ async function httpChannel(role, token) {
   const outq = [];
   let sending = false;
   let sendOff = 0;
+  // Rolling average round-trip time of a /send call (click -> relay ack).
+  // This is the number that matters for "does it feel faster": it's the
+  // client-measurable half of the input->screen loop. Exposed on the
+  // channel so vnc.html can show it on screen instead of you having to
+  // guess from feel whether a change actually helped.
+  window.__relayLatency = window.__relayLatency || { avgMs: null, lastMs: null };
   async function pumpSend() {
     if (sending) return;
     sending = true;
@@ -285,12 +291,17 @@ async function httpChannel(role, token) {
             // ?off=<bytes already sent> makes a retry after a lost response
             // idempotent: the relay skips bytes it already has.
             const q = isText ? '?t=1' : (streamMode ? `?off=${sendOff}` : '');
+            const t0 = performance.now();
             const r = await fetch(`${base}/send${q}`, {
               method: 'POST',
               headers: { 'Content-Type': isText ? 'text/plain' : 'application/octet-stream' },
               body,
               cache: 'no-store',
             });
+            const dt = performance.now() - t0;
+            const L = window.__relayLatency;
+            L.lastMs = dt;
+            L.avgMs = L.avgMs == null ? dt : L.avgMs * 0.8 + dt * 0.2;
             if (r.status === 409) { fatal('send: relay reports a gap in the browser->agent stream'); return; }
             if (!r.ok) throw new Error(`send ${r.status}`);
             if (!isText) sendOff += body.length;

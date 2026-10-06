@@ -62,6 +62,17 @@ app.set('trust proxy', true);
 // several events land within the same second.
 function ts() { return new Date().toISOString(); }
 
+// During an active VNC session, every mouse move / screen update is its own
+// HTTP chunk - potentially dozens per second. Logging each one (as this file
+// used to, unconditionally) means Node spends real time doing synchronous
+// stdout writes on the SAME single thread that's also pairing up rooms and
+// relaying bytes - on Render's free tier (a sliver of a shared vCPU) that is
+// enough to visibly add latency to every click, independent of network RTT.
+// Per-chunk logs are now opt-in (set RELAY_VERBOSE=1 in Render's env vars)
+// for when you're actively debugging a specific session; everything else
+// (connections, errors, joins/closes) still always logs.
+const VERBOSE = process.env.RELAY_VERBOSE === '1';
+
 // Room names/tokens are never logged in full (they're bearer credentials -
 // whoever holds one can join that VNC session). We log a short, still-
 // disambiguating label instead: first 6 chars of the token + a 4-char hash
@@ -676,7 +687,7 @@ app.post('/rt/:role/:token/send', express.raw({ type: () => true, limit: '10mb' 
     }
     room.recvOff[role] = expected + body.length;
   }
-  console.log(`[relay] ${ts()} http-send ${role} room ${label} bytes=${body.length} text=${isText}`);
+  if (VERBOSE) console.log(`[relay] ${ts()} http-send ${role} room ${label} bytes=${body.length} text=${isText}`);
 
   const outcome = routeMessage(room, role, body, !isText);
 
@@ -755,7 +766,7 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
     room.httpSeen[role] = Date.now();
     const part = s.buf.subarray(0, RECV_MAX_BYTES);
     if (part.length) {
-      console.log(`[relay] ${ts()} http-recv ${role} room ${label} off=${s.base} bytes=${part.length} backlog=${s.buf.length}`);
+      if (VERBOSE) console.log(`[relay] ${ts()} http-recv ${role} room ${label} off=${s.base} bytes=${part.length} backlog=${s.buf.length}`);
       return res.json({
         messages: [{
           data: (nonce ? maskBytes(part, nonce) : part).toString('base64'),
@@ -830,7 +841,7 @@ app.get('/rt/:role/:token/recv', async (req, res) => {
       }
       if (m.isBinary && zlibCrc32) m.crc = zlibCrc32(asBuf(m.data)) >>> 0;
     }
-    console.log(`[relay] ${ts()} http-recv ${role} room ${label} delivering=${messages.length} bytes=${bytes}`);
+    if (VERBOSE) console.log(`[relay] ${ts()} http-recv ${role} room ${label} delivering=${messages.length} bytes=${bytes}`);
   }
 
   res.json({
