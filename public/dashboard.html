@@ -134,6 +134,11 @@
   .waitBar i { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--accent),var(--accent2)); transition:width .9s linear; }
   .waitSec { color:var(--muted); font-size:12px; margin-bottom:16px; }
   .waitFact { background:var(--track); border-radius:12px; padding:11px 13px; font-size:13.5px; line-height:1.55; min-height:44px; transition:opacity .3s; }
+  .netBox { border-top:1px solid var(--track); margin-top:14px; padding-top:12px; }
+  .netHead { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-weight:700; }
+  .netRows { display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; font-size:13px; margin-bottom:8px; }
+  .netRows span { color:var(--muted); }
+  .netGood { color:var(--ok); font-weight:700; } .netMid { color:var(--busy); font-weight:700; } .netBad { color:var(--bad); font-weight:700; }
   .lockMark { color:var(--muted); font-size:12px; }
 </style>
 </head>
@@ -287,7 +292,9 @@ function paint(entry, c) {
     if (st.user) tag('\u{1F464} ' + st.user.split('\\').pop());
     if (st.ip) tag('\u{1F310} ' + st.ip);
     if (st.uptimeHours != null) tag('\u23F1 ' + (st.uptimeHours < 1 ? Math.round(st.uptimeHours * 60) + ' דק׳' : st.uptimeHours + ' שע׳'));
+    if (c.rttMs != null) tag('\u{1F4F6} ' + c.rttMs + ' ms', c.rttMs < 300 ? '' : 'warn');
     tag(st.vnc ? '\u2714 VNC מוכן' : '\u26A0 VNC לא זמין', st.vnc ? 'ok' : 'warn');
+    if (!c.upToDate) tag('\u2B06 ממתין לעדכון סוכן', 'warn');
   }
   r.go.disabled = !c.online || c.uninstalling;
   r.cmd.disabled = !c.online || c.uninstalling;
@@ -331,6 +338,7 @@ async function refresh() {
     render();
     checkSysInfoWatch();
     checkKillWatch();
+    checkNetWatch();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
 
@@ -404,9 +412,67 @@ function renderSysInfo(c) {
     </div>
     ${insight}
     <table class="sysTbl"><tr><th>תהליך</th><th>% מעבד</th><th>זיכרון</th><th></th></tr>${rows || '<tr><td colspan="4" style="color:var(--muted)">אין תהליכים שמעמיסים כרגע</td></tr>'}</table>
-    <div style="margin-top:12px"><button id="sysRefresh" class="small" type="button">\u{1F504} דגום שוב</button></div>`;
+    <div style="margin-top:12px"><button id="sysRefresh" class="small" type="button">\u{1F504} דגום שוב</button></div>
+    <div class="netBox" id="netBox"></div>`;
+  renderNetBox(c);
   body.querySelectorAll('button.kill').forEach((b) => { b.onclick = () => killProc(c, b); });
   const rf = $('sysRefresh'); if (rf) rf.onclick = () => openSysInfo(c, null);
+}
+
+// ---- network check ----
+const msCls = (v, good, mid) => (v == null || v < 0 ? 'netBad' : v <= good ? 'netGood' : v <= mid ? 'netMid' : 'netBad');
+const fmtMs = (v) => (v == null ? '-' : v < 0 ? 'אין תגובה' : v + ' ms');
+const mbCls = (v) => (v == null || v < 0 ? 'netBad' : v >= 5 ? 'netGood' : v >= 1 ? 'netMid' : 'netBad');
+const fmtMb = (v) => (v == null ? '-' : v < 0 ? 'נכשל' : v + ' Mbps');
+let netWatch = null; // { number, requestedAt }
+function renderNetBox(c) {
+  const box = $('netBox'); if (!box) return;
+  const n = c.netinfo;
+  const waiting = netWatch && netWatch.number === c.number;
+  let html = `<div class="netHead"><span>\u{1F310} רשת וחיבור</span><button id="netBtn" class="small" type="button" ${waiting ? 'disabled' : ''}>${waiting ? 'בודק... (עד כדקה)' : '\u{1F50D} בדוק רשת עכשיו'}</button></div>`;
+  html += `<div class="netRows"><div><span>קשר עם השרת (חי):</span> <b class="${msCls(c.rttMs, 300, 1000)}">${c.rttMs != null ? c.rttMs + ' ms' : '-'}</b></div>`
+        + `<div><span>נראה לאחרונה:</span> ${c.lastSeen ? ago(c.lastSeen) : '-'}</div></div>`;
+  if (!n) {
+    html += '<div class="sysLoading" style="padding:8px">עדיין לא בוצעה בדיקת רשת מלאה במחשב הזה. לחץ "בדוק רשת עכשיו".</div>';
+  } else {
+    const inetOk = (n.inet1Ms != null && n.inet1Ms >= 0) || (n.inet2Ms != null && n.inet2Ms >= 0);
+    const inetMs = [n.inet1Ms, n.inet2Ms].filter((v) => v != null && v >= 0);
+    html += `<div class="netRows">
+      <div><span>כרטיס רשת:</span> ${esc(n.adapter) || '-'}${n.wifi ? ' (Wi-Fi)' : n.adapter ? ' (כבל)' : ''}</div>
+      <div><span>מהירות קישור:</span> ${n.linkMbps != null ? n.linkMbps + ' Mbps' : '-'}</div>
+      <div><span>נתב (${esc(n.gateway) || '?'}):</span> <b class="${msCls(n.gatewayMs, 20, 80)}">${n.gateway ? fmtMs(n.gatewayMs) : 'לא נמצא'}</b></div>
+      <div><span>DNS:</span> <b class="${msCls(n.dnsMs, 100, 400)}">${fmtMs(n.dnsMs)}</b></div>
+      <div><span>אינטרנט כללי:</span> <b class="${inetOk ? msCls(Math.min(...inetMs), 100, 400) : 'netBad'}">${inetOk ? Math.min(...inetMs) + ' ms' : 'לא נגיש'}</b></div>
+      <div><span>שרת SIONYX:</span> <b class="${n.srvOk ? msCls(n.srvAvg, 150, 500) : 'netBad'}">${n.srvOk ? n.srvAvg + ' ms (' + n.srvMin + '–' + n.srvMax + ')' : 'לא נגיש'}</b></div>
+      <div><span>הורדה:</span> <b class="${mbCls(n.downMbps)}">${fmtMb(n.downMbps)}</b></div>
+      <div><span>העלאה:</span> <b class="${mbCls(n.upMbps)}">${fmtMb(n.upMbps)}</b></div></div>`;
+    let msg, cls = 'sysInsight';
+    if (!n.srvOk) msg = '\u274C המחשב לא הצליח להגיע לשרת בבדיקה. ייתכן שהחיבור נפל באמצע, נסה שוב.';
+    else if (n.gateway && n.gatewayMs < 0 && !inetOk) msg = '\u274C הנתב לא עונה וגם אין אינטרנט. כנראה בעיה פיזית ברשת המקומית (כבל, מתג או נתב).';
+    else if (!inetOk) msg = '\u26A0\uFE0F המחשב מחובר לשרת SIONYX, אבל האינטרנט הכללי לא נגיש ממנו. זה מתאים לרשת מסוננת או חסומה (למשל סינון), ולכן אין אינטרנט חופשי בחדר.';
+    else if (n.downMbps != null && n.downMbps >= 0 && n.downMbps < 1) msg = '\u{1F40C} יש חיבור אבל הוא איטי מאוד (פחות מ-1 Mbps). זה יכול להסביר איטיות ותקיעות.';
+    else if (n.srvMax != null && n.srvMin != null && n.srvMax - n.srvMin > 400) msg = '\u26A0\uFE0F החיבור קיים אבל לא יציב: זמני התגובה קופצים (' + n.srvMin + '–' + n.srvMax + ' ms).';
+    else { msg = '\u2705 החיבור תקין.'; cls += ' ok'; }
+    html += `<div class="${cls}">${msg}</div><div class="sysSub2">נבדק ${c.netinfoAt ? ago(c.netinfoAt) : ''}${n.took ? ' · ' + n.took + ' שניות' : ''}</div>`;
+  }
+  box.innerHTML = html;
+  const b = $('netBtn'); if (b) b.onclick = () => startNetTest(c);
+}
+function startNetTest(c) {
+  netWatch = { number: c.number, requestedAt: Date.now() };
+  renderNetBox(c);
+  api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action: 'nettest' } })
+    .catch((e) => { netWatch = null; renderNetBox(c); toast('שגיאה: ' + e.message, 'err'); });
+}
+function checkNetWatch() {
+  if (!netWatch) return;
+  const c = data.find((x) => x.number === netWatch.number); if (!c) { netWatch = null; return; }
+  const fresh = c.netinfoAt && c.netinfoAt >= netWatch.requestedAt;
+  const timedOut = Date.now() - netWatch.requestedAt > 75000;
+  if (!fresh && !timedOut) return;
+  netWatch = null;
+  if (!fresh) toast('בדיקת הרשת לא הושלמה בזמן. ייתכן שהמחשב עמוס, בשליטה, או שהסוכן שלו טרם התעדכן.', 'err');
+  if (!$('sysModal').classList.contains('hidden')) renderNetBox(c);
 }
 
 // ---- end a process ----

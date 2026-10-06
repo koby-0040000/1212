@@ -111,6 +111,7 @@ function Run-Command([string]$cmd) {
       'shutdown' { & shutdown.exe /s /t 5 /f }
       'uninstall' { Start-Uninstall }
       'sysinfo'  { $script:SysInfo = Get-SysInfo }
+      'nettest'  { $script:NetInfo = Get-NetInfo }
       default    { Log "unknown command ignored: $cmd" }
     }
   } catch { Log "command failed: $($_.Exception.Message)" }
@@ -173,7 +174,7 @@ function Test-Vnc {
 }
 
 function Get-Stats {
-  $s = @{ agent = '4'; vnc = (Test-Vnc) }
+  $s = @{ agent = '4'; ver = $script:MyVer; vnc = (Test-Vnc) }
   try {
     $os = Get-CimInstance Win32_OperatingSystem
     $s.os = [string]$os.Caption
@@ -237,6 +238,94 @@ function Get-SysInfo {
   return $out
 }
 
+# ---- network test (on demand: dashboard "check network" button) ----
+$script:MyVer = ''
+try {
+  $mine = [IO.File]::ReadAllText((Join-Path (Join-Path $env:ProgramData 'SionyxAgent') 'agent.ps1')).TrimStart([char]0xFEFF).Replace("`r", '')
+  $sha = [Security.Cryptography.SHA1]::Create()
+  $script:MyVer = (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($mine)) | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+} catch { }
+
+function Test-TcpMs([string]$h, [int]$port, [int]$ms = 2000) {
+  try {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $c = New-Object Net.Sockets.TcpClient
+    $iar = $c.BeginConnect($h, $port, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne($ms, $false) -and $c.Connected
+    $t = $sw.ElapsedMilliseconds
+    try { $c.Close() } catch { }
+    if ($ok) { return [int]$t } else { return -1 }
+  } catch { return -1 }
+}
+function Ping-Ms([string]$h) {
+  try {
+    $p = New-Object Net.NetworkInformation.Ping
+    $r = $p.Send($h, 1500)
+    if ($r.Status -eq 'Success') { return [int]$r.RoundtripTime } else { return -1 }
+  } catch { return -1 }
+}
+# Timed transfer against our own server. Returns Mbps, or -1 on failure.
+# Download: clock starts when the first byte is about to be read (excludes connect/TLS). Upload: write + response.
+function Get-HttpMbps([string]$url, [byte[]]$payload) {
+  try {
+    $req = [Net.HttpWebRequest]::Create($url)
+    $req.Timeout = 15000; $req.ReadWriteTimeout = 15000; $req.KeepAlive = $false
+    $req.Headers.Add('x-agent-key', $Key)
+    if ($payload) {
+      $req.Method = 'POST'; $req.ContentType = 'application/octet-stream'; $req.ContentLength = $payload.Length
+      $sw = [Diagnostics.Stopwatch]::StartNew()
+      $st = $req.GetRequestStream(); $st.Write($payload, 0, $payload.Length); $st.Close()
+      $resp = $req.GetResponse(); $resp.Close()
+      $bytes = $payload.Length
+    } else {
+      $resp = $req.GetResponse()
+      $sw = [Diagnostics.Stopwatch]::StartNew()
+      $rs = $resp.GetResponseStream(); $buf = New-Object byte[] 65536; $bytes = 0
+      while (($n = $rs.Read($buf, 0, $buf.Length)) -gt 0) { $bytes += $n }
+      $rs.Close(); $resp.Close()
+    }
+    $sec = [Math]::Max(0.001, $sw.Elapsed.TotalSeconds)
+    return [math]::Round(($bytes * 8) / $sec / 1e6, 1)
+  } catch { return -1 }
+}
+
+function Get-NetInfo {
+  $t0 = Get-Date
+  $n = @{}
+  try {
+    $a = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+    if ($a) { $n.adapter = [string]$a.InterfaceDescription; $n.linkMbps = [math]::Round([double]$a.Speed / 1e6); $n.wifi = [bool]($a.PhysicalMediaType -like '*802.11*') }
+  } catch { }
+  try {
+    $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+    if ($gw -and $gw -ne '0.0.0.0') { $n.gateway = [string]$gw; $n.gatewayMs = Ping-Ms $gw }
+  } catch { }
+  # General internet (outside our server): a filtered/blocked network can reach the server but not these.
+  $n.inet1Ms = Test-TcpMs '1.1.1.1' 443
+  $n.inet2Ms = Test-TcpMs '8.8.8.8' 443
+  try { $sw = [Diagnostics.Stopwatch]::StartNew(); [void][Net.Dns]::GetHostAddresses('www.google.com'); $n.dnsMs = [int]$sw.ElapsedMilliseconds } catch { $n.dnsMs = -1 }
+  # Our server: latency (4 samples) + speed.
+  $ms = @()
+  for ($i = 0; $i -lt 4; $i++) {
+    try {
+      $sw = [Diagnostics.Stopwatch]::StartNew()
+      Invoke-RestMethod -Method Get -Uri "$Server/api/agent/ping" -Headers $Headers -UseBasicParsing -TimeoutSec 8 | Out-Null
+      $ms += [int]$sw.ElapsedMilliseconds
+    } catch { }
+  }
+  $n.srvOk = ($ms.Count -gt 0)
+  if ($ms.Count -gt 0) { $m = $ms | Measure-Object -Minimum -Maximum -Average; $n.srvMin = $m.Minimum; $n.srvMax = $m.Maximum; $n.srvAvg = [math]::Round($m.Average) }
+  if ($n.srvOk) {
+    $d = Get-HttpMbps "$Server/api/agent/speedtest?kb=256" $null
+    if ($d -gt 8) { $d2 = Get-HttpMbps "$Server/api/agent/speedtest?kb=2048" $null; if ($d2 -gt 0) { $d = $d2 } }   # fast link: re-measure with a bigger file
+    $n.downMbps = $d
+    $n.upMbps = Get-HttpMbps "$Server/api/agent/speedtest-up" (New-Object byte[] 262144)
+  }
+  $n.took = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+  return $n
+}
+
+$script:LastRtt = $null
 $script:Stats = $null
 $script:StatsAt = [datetime]::MinValue
 function Refresh-Stats {
@@ -254,8 +343,13 @@ function Beat([bool]$busy) {
     # every heartbeat forever.
     if ($script:SysInfo) { $b.sysinfo = $script:SysInfo; $script:SysInfo = $null }
     if ($script:KillResult) { $b.killResult = $script:KillResult; $script:KillResult = $null }
+    if ($script:NetInfo) { $b.netinfo = $script:NetInfo; $script:NetInfo = $null }
+    if ($script:LastRtt -ne $null) { $b.rttMs = $script:LastRtt }   # round-trip of the PREVIOUS heartbeat
     $body = $b | ConvertTo-Json -Compress -Depth 4
-    return Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $resp = Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
+    $script:LastRtt = [int]$sw.ElapsedMilliseconds
+    return $resp
   } catch { return $null }
 }
 

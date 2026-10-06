@@ -30,7 +30,17 @@ const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
-const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo']);
+const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest']);
+
+// Version fingerprint of the agent script this server is serving (normalised, ASCII). Agents report
+// the fingerprint of the script they are running, so the dashboard can show who still needs the update.
+function agentFingerprint() {
+  try {
+    const t = fs.readFileSync(path.join(__dirname, 'public', 'sionyx-agent.ps1'), 'utf8').replace(/^\uFEFF/, '').replace(/\r/g, '');
+    return crypto.createHash('sha1').update(t, 'utf8').digest('hex').slice(0, 8);
+  } catch (_) { return ''; }
+}
+const AGENT_VER = agentFingerprint();
 const UNINSTALL_ALIVE_MS = 20 * 1000;
 const UNINSTALL_WAIT_MS = 2 * 60 * 1000; // how long the dashboard shows "removing..." before giving up
 const COMMAND_TTL_MS = 60 * 1000; // a queued command the agent does not pick up in time is dropped
@@ -125,10 +135,23 @@ function cleanStats(s) {
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
   const str = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
   return {
-    os: str(s.os, 80), user: str(s.user, 80), ip: str(s.ip, 45), agent: str(s.agent, 10),
+    os: str(s.os, 80), user: str(s.user, 80), ip: str(s.ip, 45), agent: str(s.agent, 10), ver: str(s.ver, 16),
     cpuPct: num(s.cpuPct), ramTotalGb: num(s.ramTotalGb), ramFreeGb: num(s.ramFreeGb),
     diskTotalGb: num(s.diskTotalGb), diskFreeGb: num(s.diskFreeGb), uptimeHours: num(s.uptimeHours),
     vnc: !!s.vnc,
+  };
+}
+
+function cleanNetInfo(n) {
+  if (!n || typeof n !== 'object') return null;
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 10) / 10 : null);
+  const str = (v, k) => (typeof v === 'string' ? v.slice(0, k) : '');
+  return {
+    adapter: str(n.adapter, 80), linkMbps: num(n.linkMbps), wifi: !!n.wifi,
+    gateway: str(n.gateway, 45), gatewayMs: num(n.gatewayMs),
+    inet1Ms: num(n.inet1Ms), inet2Ms: num(n.inet2Ms), dnsMs: num(n.dnsMs),
+    srvOk: !!n.srvOk, srvMin: num(n.srvMin), srvAvg: num(n.srvAvg), srvMax: num(n.srvMax),
+    downMbps: num(n.downMbps), upMbps: num(n.upMbps), took: num(n.took),
   };
 }
 
@@ -144,6 +167,8 @@ const view = (c) => ({
   stats: c.stats || null,
   sysinfo: c.sysinfo || null, sysinfoAt: c.sysinfoAt || null,
   killResult: c.killResult || null, killResultAt: c.killResultAt || null,
+  rttMs: c.rttMs != null ? c.rttMs : null, netinfo: c.netinfo || null, netinfoAt: c.netinfoAt || null,
+  upToDate: !!(AGENT_VER && c.stats && c.stats.ver === AGENT_VER),
 });
 
 // ---- routes ----
@@ -205,6 +230,22 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   }
   console.log(`[dash] command ${action} queued for computer ${c.number}`);
   res.json({ ok: true });
+});
+
+// ---- network test endpoints (agent only; same key as the heartbeat) ----
+const agentAuth = (req, res, next) => {
+  if (!AGENT_KEY) return res.status(503).json({ error: 'AGENT_KEY is not set on the server' });
+  if (!safeEq(req.get('x-agent-key') || '', AGENT_KEY)) return res.status(401).json({ error: 'bad agent key' });
+  next();
+};
+router.get('/agent/ping', agentAuth, (_req, res) => { res.set('Cache-Control', 'no-store'); res.json({ t: Date.now() }); });
+router.get('/agent/speedtest', agentAuth, (req, res) => {
+  const kb = Math.max(16, Math.min(2048, parseInt(req.query.kb, 10) || 256));
+  res.set({ 'Cache-Control': 'no-store', 'Content-Type': 'application/octet-stream', 'Content-Length': String(kb * 1024) });
+  res.end(crypto.randomBytes(kb * 1024)); // incompressible, so proxies/compression cannot inflate the result
+});
+router.post('/agent/speedtest-up', agentAuth, express.raw({ type: '*/*', limit: '600kb' }), (req, res) => {
+  res.set('Cache-Control', 'no-store'); res.json({ bytes: Buffer.isBuffer(req.body) ? req.body.length : 0 });
 });
 
 // End one process on a computer (from the "פרטי מחשב" window). The agent re-checks
@@ -273,6 +314,9 @@ router.post('/agent/heartbeat', (req, res) => {
   // Get-SysInfo in sionyx-agent.ps1) - most heartbeats won't carry this.
   const si = cleanSysInfo(body.sysinfo);
   if (si) { c.sysinfo = si; c.sysinfoAt = now; }
+  if (typeof body.rttMs === 'number' && body.rttMs >= 0 && body.rttMs < 60000) { c.rttMs = Math.round(body.rttMs); c.rttAt = now; }
+  const ni = cleanNetInfo(body.netinfo);
+  if (ni) { c.netinfo = ni; c.netinfoAt = now; }
   const kr = body.killResult;
   if (kr && typeof kr === 'object') {
     c.killResult = { pid: Number(kr.pid) || 0, name: String(kr.name || '').slice(0, 60), ok: !!kr.ok, msg: String(kr.msg || '').slice(0, 120) };
