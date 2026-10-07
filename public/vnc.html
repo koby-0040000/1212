@@ -21,7 +21,9 @@
   #toolbar button.active { background: #2f6fed; border-color: #2f6fed; }
   #toolbar select { background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 4px; font-size: 13px; }
   #toolbar .sep { width: 1px; height: 22px; background: #444; margin: 0 4px; }
-  #pasteBox { width: 160px; font-size: 13px; padding: 4px; border-radius: 4px; border: 1px solid #555; background: #222; color: #eee; }
+  #toolbar { overflow-x: auto; white-space: nowrap; }
+  #clipNotice { cursor: pointer; }
+  #pasteBox { width: 110px; font-size: 13px; padding: 4px; border-radius: 4px; border: 1px solid #555; background: #222; color: #eee; }
   #clipNotice {
     position: fixed; bottom: 48px; left: 8px; color: #ddd; font-size: 12px;
     background: rgba(0,0,0,.6); padding: 4px 8px; border-radius: 6px; z-index: 10;
@@ -38,8 +40,14 @@
   <button id="btnAltTab" title="Alt+Tab">Alt+Tab</button>
   <button id="btnWin" title="מקש Windows">Win</button>
   <div class="sep"></div>
-  <input id="pasteBox" placeholder="הדבק כאן ← שלח למחשב" />
-  <button id="btnSendPaste" title="שלח את הטקסט הזה כהקלדה למחשב המרוחק">שלח</button>
+  <button id="btnPaste" title="מדביק את מה שהעתקת אצלך (בלוח של המחשב שלך) אל המחשב המרוחק. אפשר גם פשוט ללחוץ Ctrl+V בתוך המסך. Ctrl+Shift+V = תמיד כהקלדה.">&#128203; הדבק</button>
+  <select id="pasteMode" title="שיטת ההדבקה. אוטומטי: טקסט קצר מוקלד, טקסט ארוך עובר דרך הלוח של המחשב המרוחק.">
+    <option value="auto" selected>הדבקה: אוטומטי</option>
+    <option value="clip">דרך הלוח + Ctrl+V</option>
+    <option value="type">כהקלדה</option>
+  </select>
+  <input id="pasteBox" placeholder="גיבוי: הדבק כאן" title="אם הדפדפן חוסם גישה ללוח: לחץ Ctrl+V בתיבה הזו והטקסט יישלח אוטומטית." />
+  <button id="btnSendPaste" title="שלח את הטקסט שבתיבה למחשב המרוחק">שלח</button>
   <button id="btnCopyRemote" title="העתק את מה שהועתק במחשב המרוחק" disabled>העתק ממחשב מרוחק</button>
   <div class="sep"></div>
   <span style="color:#aaa; font-size:12px;">מהירות:</span>
@@ -272,16 +280,110 @@
       setTimeout(() => clipNoticeEl.style.display = 'none', 2500);
     });
 
-    // Local -> remote clipboard: type/paste into the box, then send. This
-    // is a workaround, not real bidirectional clipboard sync, because a
-    // browser tab has no standing permission to read the OS clipboard on
-    // its own - it can only read what the user explicitly pastes into a
-    // page element.
+    // ---- Smart local -> remote paste ----
+    // Press Ctrl+V anywhere on the remote screen (or click "הדבק"): the text from YOUR clipboard is
+    // sent to the remote computer, like in other remote-control tools.
+    //  * short text, text with Hebrew/Unicode, or login screens -> typed key by key (always works)
+    //  * long text -> put in the remote clipboard, then Ctrl+V is pressed there (fast, one shot)
+    // The browser only lets a page read the clipboard on a user action; the first time Chrome asks
+    // once for permission. If that is blocked, paste (Ctrl+V) into the small "גיבוי" box instead.
+    const pasteModeSel = document.getElementById('pasteMode');
+    const pasteBox = document.getElementById('pasteBox');
+    try { const m = localStorage.getItem('pasteMode'); if (m) pasteModeSel.value = m; } catch (e) {}
+    pasteModeSel.addEventListener('change', () => { try { localStorage.setItem('pasteMode', pasteModeSel.value); } catch (e) {} rfb.focus(); });
+    let pasteBusy = false, pasteAbort = false, noticeTimer = null;
+    const notice = (t, ms = 2500) => {
+      clipNoticeEl.textContent = t; clipNoticeEl.style.display = 'block';
+      clearTimeout(noticeTimer); if (ms) noticeTimer = setTimeout(() => { clipNoticeEl.style.display = 'none'; }, ms);
+    };
+    clipNoticeEl.addEventListener('click', () => { if (pasteBusy) pasteAbort = true; });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // The page already told the remote that Ctrl (and maybe Shift) is held when the user pressed Ctrl+V.
+    // Release every modifier first, otherwise the typed characters would arrive as shortcuts.
+    const releaseModifiers = () => {
+      [[0xffe3, 'ControlLeft'], [0xffe4, 'ControlRight'], [0xffe9, 'AltLeft'], [0xffea, 'AltRight'],
+       [0xffe1, 'ShiftLeft'], [0xffe2, 'ShiftRight'], [0xffeb, 'MetaLeft']].forEach(([ks, code]) => rfb.sendKey(ks, code, false));
+    };
+    const keysymFor = (ch) => {
+      const cp = ch.codePointAt(0);
+      if (ch === '\n') return 0xff0d;                 // Return
+      if (ch === '\t') return 0xff09;                 // Tab
+      if (cp < 0x20 || cp === 0x7f) return 0;         // other control chars: skip
+      if (cp <= 0x7e || (cp >= 0xa0 && cp <= 0xff)) return cp;
+      return 0x01000000 + cp;                         // Unicode keysym (e.g. Hebrew)
+    };
+    async function typeText(text) {
+      const chars = [...text]; let n = 0;
+      for (const ch of chars) {
+        if (pasteAbort) break;
+        const ks = keysymFor(ch);
+        if (ks) { rfb.sendKey(ks, undefined, true); rfb.sendKey(ks, undefined, false); }
+        n++;
+        if (ch === '\n') await sleep(60);             // let a console run the line
+        else if (n % 15 === 0) { if (chars.length > 60) notice(`מקליד... ${n}/${chars.length} (לחץ כאן לעצירה)`, 0); await sleep(25); }
+      }
+      return n;
+    }
+    async function pasteViaClipboard(text) {
+      rfb.clipboardPasteFrom(text);
+      await sleep(250);                               // give the remote time to take the clipboard
+      rfb.sendKey(0xffe3, 'ControlLeft', true);
+      rfb.sendKey(0x76, 'KeyV', true); rfb.sendKey(0x76, 'KeyV', false);
+      rfb.sendKey(0xffe3, 'ControlLeft', false);
+    }
+    async function smartPaste(raw, force) {
+      const text = String(raw || '').replace(/\r\n?/g, '\n');
+      if (!text) { notice('הלוח ריק - קודם תעתיק משהו'); return; }
+      if (pasteBusy) { notice('הדבקה קודמת עדיין רצה'); return; }
+      pasteBusy = true; pasteAbort = false;
+      try {
+        const mode = force || pasteModeSel.value;
+        const latin1 = ![...text].some((c) => c.codePointAt(0) > 0xff);
+        let how = mode;
+        if (mode === 'auto') how = (latin1 && text.length > 60) ? 'clip' : 'type';
+        if (how === 'clip' && !latin1) { how = 'type'; }   // the classic VNC clipboard is Latin-1 only (Hebrew would turn into "?")
+        releaseModifiers();
+        if (how === 'clip') {
+          await pasteViaClipboard(text);
+          notice(`הודבקו ${[...text].length} תווים (דרך הלוח)`);
+        } else {
+          const n = await typeText(text);
+          notice(pasteAbort ? `נעצר אחרי ${n} תווים` : `הוקלדו ${n} תווים` + (latin1 ? '' : ' (עברית: צריך שפת מקלדת עברית פעילה במחשב המרוחק)'), 3500);
+        }
+      } catch (e) {
+        notice('ההדבקה נכשלה: ' + (e && e.message ? e.message : e));
+      } finally { pasteBusy = false; pasteAbort = false; rfb.focus(); }
+    }
+    async function pasteFromBrowserClipboard(force) {
+      let text = '';
+      try { text = await navigator.clipboard.readText(); }
+      catch (e) {
+        notice('הדפדפן חסם גישה ללוח. אשר גישה בסמל שליד הכתובת, או הדבק (Ctrl+V) בתיבה "גיבוי" בסרגל.', 6000);
+        pasteBox.focus(); return;
+      }
+      await smartPaste(text, force);
+    }
+    // Ctrl+V / Cmd+V on the remote screen (capture phase: runs before noVNC forwards the key).
+    // Works with any keyboard layout (e.code), so Hebrew layout is fine too.
+    window.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.code !== 'KeyV') return;
+      const t = e.target;
+      if (t && t.matches && t.matches('input, textarea, select')) return;   // normal paste into toolbar boxes
+      e.preventDefault(); e.stopImmediatePropagation();
+      pasteFromBrowserClipboard(e.shiftKey ? 'type' : undefined);
+    }, true);
+    document.getElementById('btnPaste').addEventListener('click', () => pasteFromBrowserClipboard());
+    // Backup box: a real paste event needs no permission at all.
+    pasteBox.addEventListener('paste', (e) => {
+      const text = e.clipboardData ? e.clipboardData.getData('text') : '';
+      if (!text) return;
+      e.preventDefault(); pasteBox.value = '';
+      smartPaste(text);
+    });
     document.getElementById('btnSendPaste').addEventListener('click', () => {
-      const box = document.getElementById('pasteBox');
-      if (!box.value) return;
-      rfb.clipboardPasteFrom(box.value);
-      box.value = '';
+      if (!pasteBox.value) return;
+      const t = pasteBox.value; pasteBox.value = '';
+      smartPaste(t);
     });
 
     // Alt+Tab and Win: the OS intercepts these before a normal keystroke
