@@ -24,7 +24,7 @@ const VNC_PASSWORD = process.env.VNC_PASSWORD || '';
 const SECRET = process.env.SESSION_SECRET
   || crypto.createHash('sha256').update(`sionyx-dash|${DASHBOARD_PASSWORD}|${AGENT_KEY}`).digest('hex');
 
-const ONLINE_MS = 25000;            // no heartbeat for this long => offline
+const ONLINE_MS = 45000;            // no heartbeat for this long => offline
 const COOKIE = 'sx_dash';
 const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
@@ -223,6 +223,11 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   if (!COMMANDS.has(action)) return res.status(400).json({ error: 'unknown action' });
   c.commands = (c.commands || []).slice(-4);
   c.commands.push({ action, at: Date.now() });
+  // sysinfo/nettest only on an agent that runs the current script: older versions run them inline and can
+  // freeze the whole agent (computer then shows as not connected) on slow or broken-WMI computers.
+  if ((action === 'sysinfo' || action === 'nettest') && !(AGENT_VER && c.stats && c.stats.ver === AGENT_VER)) {
+    return res.status(409).json({ error: 'agent_outdated' });
+  }
   if (action === 'uninstall') {
     // agents older than v3 do not know this command and would ignore it forever
     if (!c.stats || Number(c.stats.agent) < 3) return res.status(409).json({ error: 'agent_outdated' });
@@ -254,7 +259,7 @@ router.post('/computers/:number/kill', requireAuth, (req, res) => {
   const c = computers.get(req.params.number);
   if (!c) return res.status(404).json({ error: 'unknown computer' });
   if (!isOnline(c)) return res.status(409).json({ error: 'offline' });
-  if (!c.stats || Number(c.stats.agent) < 4) return res.status(409).json({ error: 'agent_outdated' });
+  if (!(AGENT_VER && c.stats && c.stats.ver === AGENT_VER)) return res.status(409).json({ error: 'agent_outdated' });
   const pid = Number(req.body && req.body.pid);
   const name = String((req.body && req.body.name) || '');
   if (!Number.isInteger(pid) || pid <= 4 || pid > 4194304) return res.status(400).json({ error: 'bad pid' });

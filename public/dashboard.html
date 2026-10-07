@@ -163,7 +163,7 @@
     </div>
     <div class="chips">
       <div class="chip"><b id="sOnline">0</b><span>פעילים</span></div>
-      <div class="chip"><b id="sOff">0</b><span>כבויים</span></div>
+      <div class="chip"><b id="sOff">0</b><span>לא מחוברים</span></div>
       <div class="chip"><b id="sTotal">0</b><span>סה״כ</span></div>
     </div>
     <div class="tools">
@@ -275,7 +275,7 @@ function paint(entry, c) {
   const state = c.uninstalling ? 'removing' : c.uninstallFailed ? 'failed' : c.busy ? 'busy' : c.online ? 'online' : 'off';
   entry.el.className = 'card s-' + state + (entry.el.classList.contains('enter') ? ' enter' : '');
   r.badge.className = 'badge ' + state;
-  r.badgeTxt.textContent = { removing: 'מסיר...', failed: 'ההסרה נכשלה', busy: 'בשליטה', online: 'פעיל', off: 'כבוי' }[state];
+  r.badgeTxt.textContent = { removing: 'מסיר...', failed: 'ההסרה נכשלה', busy: 'בשליטה', online: 'פעיל', off: 'לא מחובר' }[state];
   r.sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
   r.seen.textContent = 'נראה לאחרונה: ' + (c.online ? 'עכשיו' : ago(c.lastSeen));
   r.note.style.display = state === 'failed' ? '' : 'none';
@@ -462,7 +462,7 @@ function startNetTest(c) {
   netWatch = { number: c.number, requestedAt: Date.now() };
   renderNetBox(c);
   api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action: 'nettest' } })
-    .catch((e) => { netWatch = null; renderNetBox(c); toast('שגיאה: ' + e.message, 'err'); });
+    .catch((e) => { netWatch = null; renderNetBox(c); toast(e.message === 'agent_outdated' ? OUTDATED_MSG : 'שגיאה: ' + e.message, 'err'); });
 }
 function checkNetWatch() {
   if (!netWatch) return;
@@ -487,7 +487,7 @@ async function killProc(c, btn) {
     toast('הבקשה נשלחה למחשב, ממתין לאישור...');
   } catch (e) {
     btn.disabled = false; btn.textContent = 'סיים';
-    toast(e.message === 'agent_outdated' || e.status === 409 ? 'המחשב כבוי או שהסוכן שלו ישן (עדיין לא התעדכן)' : 'שגיאה: ' + e.message, 'err');
+    toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב לא מחובר' : 'שגיאה: ' + e.message, 'err');
   }
 }
 function checkKillWatch() {
@@ -505,6 +505,7 @@ function checkKillWatch() {
   if (r.ok && !$('sysModal').classList.contains('hidden')) openSysInfo(c, null); // refresh the list
 }
 
+const OUTDATED_MSG = 'המחשב עדיין לא התעדכן לגרסת הסוכן החדשה. העדכון מגיע לבד תוך כ-10 דקות מרגע שהוא דלוק ומחובר.';
 const WAIT_STEPS = ['שולח בקשה למחשב...', 'המחשב קולט את הבקשה...', 'דוגם את המעבד ואת התהליכים...', 'אורז את התוצאות...', 'עוד רגע, המחשב עסוק קצת...'];
 const WAIT_FACTS = [
   '\u{1F9E0} המעבד המסחרי הראשון, Intel 4004 מ-1971, הכיל כ-2,300 טרנזיסטורים. מעבד מודרני מכיל מיליארדים.',
@@ -554,7 +555,7 @@ function openSysInfo(c, btn) {
   sysWatch = { number: c.number, requestedAt: Date.now(), btn };
   if (btn) { btn.disabled = true; btn.textContent = 'מבקש...'; }
   api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action: 'sysinfo' } })
-    .catch((e) => { stopSysLoad(); $('sysBody').innerHTML = `<div class="sysLoading">שגיאה: ${esc(e.message)}</div>`; sysWatch = null; if (btn) { btn.disabled = false; btn.textContent = '\u{1F4CA} פרטי מחשב'; } });
+    .catch((e) => { stopSysLoad(); $('sysBody').innerHTML = `<div class="sysLoading">${e.message === 'agent_outdated' ? OUTDATED_MSG : 'שגיאה: ' + esc(e.message)}</div>`; sysWatch = null; if (btn) { btn.disabled = false; btn.textContent = '\u{1F4CA} פרטי מחשב'; } });
 }
 
 function checkSysInfoWatch() {

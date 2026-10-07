@@ -110,8 +110,8 @@ function Run-Command([string]$cmd) {
       'restart'  { & shutdown.exe /r /t 5 /f }
       'shutdown' { & shutdown.exe /s /t 5 /f }
       'uninstall' { Start-Uninstall }
-      'sysinfo'  { $script:SysInfo = Get-SysInfo }
-      'nettest'  { $script:NetInfo = Get-NetInfo }
+      'sysinfo'  { Start-SysInfoJob }
+      'nettest'  { Start-NetTestJob }
       default    { Log "unknown command ignored: $cmd" }
     }
   } catch { Log "command failed: $($_.Exception.Message)" }
@@ -325,6 +325,71 @@ function Get-NetInfo {
   return $n
 }
 
+# ---- background jobs ----
+# "sysinfo" and "nettest" talk to WMI / the network and can block for a LONG time on weak or
+# misconfigured computers (a hung WMI call never returns). They used to run inline in the main
+# loop, which stopped the heartbeat - the dashboard then showed the computer as "off" even though
+# it was on. Now they run in their own runspace with a hard time limit; the main loop never waits.
+$script:BgJobs = @{}
+function Build-JobScript([string[]]$FuncNames, [string]$Prefix, [string]$Call) {
+  $sb = New-Object Text.StringBuilder
+  [void]$sb.AppendLine('[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12')
+  [void]$sb.AppendLine('function Log($m) { }')
+  [void]$sb.AppendLine($Prefix)
+  foreach ($f in $FuncNames) { [void]$sb.AppendLine("function $f {"); [void]$sb.AppendLine((Get-Command $f -CommandType Function).ScriptBlock.ToString()); [void]$sb.AppendLine('}') }
+  [void]$sb.AppendLine($Call)
+  return $sb.ToString()
+}
+function Start-BgJob([string]$name, [string]$code) {
+  if ($script:BgJobs.ContainsKey($name)) { Log "background job $name already running - request ignored"; return }
+  try {
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($code)
+    $script:BgJobs[$name] = @{ Ps = $ps; Handle = $ps.BeginInvoke(); At = Get-Date }
+  } catch { Log "could not start background job $name : $($_.Exception.Message)" }
+}
+function Start-SysInfoJob {
+  $list = ($script:ProtectedProcs | ForEach-Object { "'" + $_ + "'" }) -join ','
+  $prefix = "`$script:ProtectedProcs = @($list)"
+  Start-BgJob 'sysinfo' (Build-JobScript @('Get-SysInfo') $prefix 'Get-SysInfo')
+}
+function Start-NetTestJob {
+  $k = $Key.Replace("'", "''"); $sv = $Server.Replace("'", "''")
+  $prefix = "`$Server = '$sv'; `$Key = '$k'; `$Headers = @{ 'x-agent-key' = `$Key }"
+  Start-BgJob 'nettest' (Build-JobScript @('Test-TcpMs','Ping-Ms','Get-HttpMbps','Get-NetInfo') $prefix 'Get-NetInfo')
+}
+
+function Poll-BgJobs {
+  foreach ($name in @($script:BgJobs.Keys)) {
+    $j = $script:BgJobs[$name]
+    if ($j.Handle.IsCompleted) {
+      $val = $null
+      try { $val = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -Last 1 } catch { Log "background job $name failed: $($_.Exception.Message)" }
+      try { $j.Ps.Dispose() } catch { }
+      $script:BgJobs.Remove($name)
+      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } }
+    } elseif (((Get-Date) - $j.At).TotalSeconds -gt 100) {
+      Log "background job $name timed out after 100s - abandoned (the heartbeat keeps running)"
+      try { [void]$j.Ps.BeginStop($null, $null) } catch { }
+      $script:BgJobs.Remove($name)
+    }
+  }
+}
+
+# Makes sure the scheduled task also has a repeating "start if not running" trigger, so the agent
+# comes back by itself if its process ever exits (e.g. after a self-update) instead of waiting for a reboot.
+function Ensure-Watchdog {
+  try {
+    $t = Get-ScheduledTask -TaskName 'SionyxAgent' -ErrorAction Stop
+    foreach ($tr in @($t.Triggers)) { if ($tr.Repetition -and $tr.Repetition.Interval) { return } }
+    $startup = New-ScheduledTaskTrigger -AtStartup
+    $rep = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $set = $t.Settings; $set.MultipleInstances = 'IgnoreNew'
+    Set-ScheduledTask -TaskName 'SionyxAgent' -Trigger @($startup, $rep) -Settings $set | Out-Null
+    Log 'watchdog trigger added to the scheduled task'
+  } catch { Log "watchdog setup skipped: $($_.Exception.Message)" }
+}
+
 $script:LastRtt = $null
 $script:Stats = $null
 $script:StatsAt = [datetime]::MinValue
@@ -521,13 +586,15 @@ function Check-ForUpdate {
     if ($latest -and $latest -ne $current) {
       Log 'new agent version found on the server - updating and restarting'
       [IO.File]::WriteAllText($script:AgentFile, $latest)
-      exit 0   # scheduled task restarts us automatically with the new file
+      exit 1   # non-zero = the scheduled task's restart policy relaunches us in ~1 min (the watchdog trigger is the backup)
     }
   } catch { Log "update check failed: $($_.Exception.Message)" }
 }
 
 Log "agent started: computer $ComputerNumber -> $Server"
+Ensure-Watchdog
 while ($true) {
+  Poll-BgJobs
   Refresh-Stats
   $r = Beat $false
   Handle-Reply $r
