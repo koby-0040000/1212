@@ -31,7 +31,8 @@ const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
-const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest', 'getlog', 'restartfilter']);
+const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose']);
+const FIXES = new Set(['clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced']);
 
 // Version fingerprint of the agent script this server is serving (normalised, ASCII). Agents report
 // the fingerprint of the script they are running, so the dashboard can show who still needs the update.
@@ -143,6 +144,30 @@ function cleanStats(s) {
   };
 }
 
+function cleanDiag(d) {
+  if (!d || typeof d !== 'object' || !Array.isArray(d.findings)) return null;
+  const SEV = new Set(['ok', 'warn', 'bad']);
+  const findings = d.findings.slice(0, 20).map((f) => {
+    if (!f || typeof f !== 'object') return null;
+    const p = {};
+    if (f.p && typeof f.p === 'object') {
+      for (const k of Object.keys(f.p).slice(0, 8)) {
+        const v = f.p[k];
+        if (typeof v === 'number' && Number.isFinite(v)) p[String(k).slice(0, 20)] = v;
+        else if (typeof v === 'string') p[String(k).slice(0, 20)] = v.slice(0, 120);
+      }
+    }
+    const id = typeof f.id === 'string' && /^[a-z_]{2,30}$/.test(f.id) ? f.id : '';
+    if (!id) return null;
+    return { id, sev: SEV.has(f.sev) ? f.sev : 'warn', fix: FIXES.has(f.fix) ? f.fix : '', p };
+  }).filter(Boolean);
+  return { findings, checks: Number(d.checks) || 0, took: Number(d.took) || 0 };
+}
+function cleanFixResults(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.slice(0, 6).map((r) => (r && FIXES.has(r.id) ? { id: r.id, ok: !!r.ok, msg: String(r.msg || '').slice(0, 180), freedMb: Number(r.freedMb) || 0 } : null)).filter(Boolean);
+}
+
 function cleanNetInfo(n) {
   if (!n || typeof n !== 'object') return null;
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 10) / 10 : null);
@@ -164,6 +189,7 @@ const view = (c) => ({
   number: c.number, name: c.name || '', hostname: c.hostname || '',
   online: isOnline(c), connState: connState(c), busy: isOnline(c) && !!c.busy,
   logAt: c.logAt || null,
+  diagAt: c.diagAt || null, diagCount: c.diag ? c.diag.findings.filter((f) => f.sev !== 'ok').length : null, fixAt: c.fixAt || null,
   // "removing..." only while the computer has not come back with a heartbeat after the command;
   // if it is still alive 20s later the removal did not happen -> report a failure instead of hanging.
   uninstalling: !!c.uninstallAt && Date.now() - c.uninstallAt < UNINSTALL_WAIT_MS && !(c.lastSeen > c.uninstallAt + UNINSTALL_ALIVE_MS),
@@ -229,7 +255,7 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   if (!COMMANDS.has(action)) return res.status(400).json({ error: 'unknown action' });
   // These need the current agent script: older versions run heavy work inline and can freeze the whole agent
   // (computer then shows as not connected) on slow or broken-WMI computers, or do not know the command at all.
-  if (['sysinfo', 'nettest', 'getlog', 'restartfilter'].includes(action) && !isCurrent(c)) {
+  if (['sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose'].includes(action) && !isCurrent(c)) {
     return res.status(409).json({ error: 'agent_outdated' });
   }
   if (action === 'uninstall') {
@@ -239,7 +265,7 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   }
   c.commands = (c.commands || []).slice(-4);
   c.commands.push({ action, at: Date.now() });
-  if (!['sysinfo', 'nettest', 'getlog'].includes(action)) addEvent(c.number, 'cmd', 'פקודה: ' + action);
+  if (!['sysinfo', 'nettest', 'getlog', 'diagnose'].includes(action)) addEvent(c.number, 'cmd', 'פקודה: ' + action);
   console.log(`[dash] command ${action} queued for computer ${c.number}`);
   res.json({ ok: true });
 });
@@ -258,6 +284,27 @@ router.get('/agent/speedtest', agentAuth, (req, res) => {
 });
 router.post('/agent/speedtest-up', agentAuth, express.raw({ type: '*/*', limit: '600kb' }), (req, res) => {
   res.set('Cache-Control', 'no-store'); res.json({ bytes: Buffer.isBuffer(req.body) ? req.body.length : 0 });
+});
+
+// Repairs: only ids from the FIXES whitelist; the agent re-checks the whitelist on its side too.
+router.post('/computers/:number/fix', requireAuth, (req, res) => {
+  const c = computers.get(req.params.number);
+  if (!c) return res.status(404).json({ error: 'unknown computer' });
+  if (!isOnline(c)) return res.status(409).json({ error: 'offline' });
+  if (!isCurrent(c)) return res.status(409).json({ error: 'agent_outdated' });
+  const ids = (Array.isArray(req.body && req.body.ids) ? req.body.ids : []).map(String).filter((x) => FIXES.has(x));
+  if (!ids.length) return res.status(400).json({ error: 'no valid fix' });
+  const uniq = [...new Set(ids)].slice(0, 6);
+  c.fixes = (c.fixes || []).slice(-6);
+  uniq.forEach((id) => c.fixes.push({ id, at: Date.now() }));
+  c.fixResults = (c.fixResults || []);
+  addEvent(c.number, 'cmd', 'תיקון מרחוק: ' + uniq.join(', '));
+  res.json({ ok: true, ids: uniq });
+});
+router.get('/computers/:number/diag', requireAuth, (req, res) => {
+  const c = computers.get(req.params.number);
+  if (!c) return res.status(404).json({ error: 'unknown computer' });
+  res.json({ diag: c.diag || null, diagAt: c.diagAt || null, fixResults: c.fixResults || [] });
 });
 
 // End one process on a computer (from the "פרטי מחשב" window). The agent re-checks
@@ -330,6 +377,13 @@ router.post('/agent/heartbeat', (req, res) => {
   if (typeof body.rttMs === 'number' && body.rttMs >= 0 && body.rttMs < 60000) { c.rttMs = Math.round(body.rttMs); c.rttAt = now; }
   const ni = cleanNetInfo(body.netinfo);
   if (ni) { c.netinfo = ni; c.netinfoAt = now; }
+  const dg = cleanDiag(body.diag);
+  if (dg) { c.diag = dg; c.diagAt = now; }
+  const fr = cleanFixResults(body.fixResults);
+  if (fr.length) {
+    c.fixResults = (c.fixResults || []).concat(fr.map((r) => ({ ...r, at: now }))).slice(-12); c.fixAt = now;
+    fr.forEach((r) => addEvent(c.number, 'info', `תיקון ${r.id}: ${r.ok ? 'הצליח' : 'נכשל'}${r.msg ? ' (' + r.msg + ')' : ''}`));
+  }
   if (typeof body.logTail === 'string') { c.logTail = body.logTail.slice(-8000); c.logAt = now; }
   const kr = body.killResult;
   if (kr && typeof kr === 'object') {
@@ -347,8 +401,10 @@ router.post('/agent/heartbeat', (req, res) => {
   c.commands = [];
   const kills = (c.kills || []).filter((x) => now2 - x.at < COMMAND_TTL_MS).map((x) => ({ pid: x.pid, name: x.name }));
   c.kills = [];
+  const fixes = (c.fixes || []).filter((x) => now2 - x.at < COMMAND_TTL_MS).map((x) => x.id);
+  c.fixes = [];
   scheduleSave();
-  res.json({ session, commands, kills });
+  res.json({ session, commands, kills, fixes });
 });
 
 // The agent calls this right before it deletes itself from the computer: the computer is

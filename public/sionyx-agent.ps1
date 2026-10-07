@@ -112,6 +112,7 @@ function Run-Command([string]$cmd) {
       'uninstall' { Start-Uninstall }
       'sysinfo'  { Start-SysInfoJob }
       'nettest'  { Start-NetTestJob }
+      'diagnose' { Start-DiagJob }
       'getlog'   { try { $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction Stop) -join "`n") } catch { $script:LogTail = '(no log yet)' } }
       'restartfilter' {
         # Fixed, built-in sequence (not remote code): restart the content-filter services. Runs in the background (~20s).
@@ -155,6 +156,7 @@ function Kill-Proc($k) {
 
 function Handle-Reply($r) {
   if ($r -and $r.commands) { foreach ($c in @($r.commands)) { Run-Command ([string]$c) } }
+  if ($r -and $r.fixes) { foreach ($x in @($r.fixes)) { $id = [string]$x; if ($id -match '^[a-z_]{3,24}$') { $script:FixQueue.Enqueue($id) } } }
   if ($r -and $r.kills) { foreach ($k in @($r.kills)) { Kill-Proc $k } }
 }
 
@@ -373,13 +375,212 @@ function Poll-BgJobs {
       try { $val = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -Last 1 } catch { Log "background job $name failed: $($_.Exception.Message)" }
       try { $j.Ps.Dispose() } catch { }
       $script:BgJobs.Remove($name)
-      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
-    } elseif (((Get-Date) - $j.At).TotalSeconds -gt 100) {
-      Log "background job $name timed out after 100s - abandoned (the heartbeat keeps running)"
+      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'diag') { $script:DiagResult = $val } elseif ($name -eq 'fix') { $script:FixResults += $val; Log ("fix result: " + $val.id + ' ok=' + $val.ok + ' ' + $val.msg) } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
+    } elseif (((Get-Date) - $j.At).TotalSeconds -gt $(if ($name -eq 'fix') { 300 } else { 100 })) {
+      Log "background job $name timed out - abandoned (the heartbeat keeps running)"
       try { [void]$j.Ps.BeginStop($null, $null) } catch { }
       $script:BgJobs.Remove($name)
     }
   }
+}
+
+# ---- diagnose & repair (on demand from the dashboard "check and repair" window) ----
+# Safe by design: "diagnose" only READS. Repairs are a fixed whitelist (Invoke-Fix below); nothing here runs
+# code that arrives from the server - the server can only name a fix id, and unknown ids are refused.
+function Get-TempDirs {
+  $d = @("$env:windir\Temp")
+  try {
+    Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+      $t = Join-Path $_.FullName 'AppData\Local\Temp'
+      if (Test-Path $t) { $d += $t }
+    }
+  } catch { }
+  return $d
+}
+function Get-TempBytes {
+  $cut = (Get-Date).AddDays(-1); $sum = 0
+  foreach ($p in (Get-TempDirs)) {
+    $m = Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut } | Measure-Object -Property Length -Sum
+    if ($m.Sum) { $sum += $m.Sum }
+  }
+  return $sum
+}
+
+function Get-Diagnosis {
+  $t0 = Get-Date
+  $f = New-Object System.Collections.ArrayList
+  $checks = 0
+  $os = $null
+  try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { }
+
+  # 1. disk space
+  try {
+    $checks++
+    $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
+    $freeGb = [math]::Round($d.FreeSpace / 1GB, 1); $totGb = [math]::Round($d.Size / 1GB, 1)
+    $pct = 100; if ($totGb -gt 0) { $pct = [math]::Round($freeGb / $totGb * 100) }
+    if ($freeGb -lt 8 -or $pct -lt 8) { [void]$f.Add(@{ id = 'disk_low'; sev = 'bad'; fix = 'clean_temp'; p = @{ freeGb = $freeGb; totalGb = $totGb; pct = $pct } }) }
+    elseif ($freeGb -lt 20 -or $pct -lt 15) { [void]$f.Add(@{ id = 'disk_low'; sev = 'warn'; fix = 'clean_temp'; p = @{ freeGb = $freeGb; totalGb = $totGb; pct = $pct } }) }
+  } catch { }
+  # 2. old temp files
+  try {
+    $checks++
+    $mb = [math]::Round((Get-TempBytes) / 1MB)
+    if ($mb -gt 800) { [void]$f.Add(@{ id = 'temp_big'; sev = 'warn'; fix = 'clean_temp'; p = @{ mb = $mb } }) }
+  } catch { }
+  # 3. WMI health (a slow/broken WMI makes many tools hang)
+  try {
+    $checks++
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    [void](Get-CimInstance Win32_Processor -ErrorAction Stop)
+    $ms = [int]$sw.ElapsedMilliseconds
+    if ($ms -gt 4000) { [void]$f.Add(@{ id = 'wmi_slow'; sev = 'warn'; fix = 'repair_wmi'; p = @{ ms = $ms } }) }
+  } catch { [void]$f.Add(@{ id = 'wmi_slow'; sev = 'bad'; fix = 'repair_wmi'; p = @{ ms = -1 } }) }
+  # 4. important services
+  try {
+    $checks++
+    $down = @()
+    foreach ($n in @('WiFree3', 'ContentBlockerAgent', 'tvnserver', 'SionyxInputInjector', 'Dnscache', 'Winmgmt')) {
+      $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+      if ($s -and $s.StartType -ne 'Disabled' -and $s.Status -ne 'Running') { $down += $n }
+    }
+    if ($down.Count -gt 0) { [void]$f.Add(@{ id = 'svc_stopped'; sev = 'bad'; fix = 'start_services'; p = @{ names = ($down -join ', ') } }) }
+  } catch { }
+  # 5. clock vs server (a wrong clock breaks HTTPS and logins)
+  try {
+    $checks++
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-RestMethod -Method Get -Uri "$Server/api/agent/ping" -Headers $Headers -UseBasicParsing -TimeoutSec 8
+    $rtt = $sw.ElapsedMilliseconds
+    $nowMs = ((Get-Date).ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds
+    $skew = [math]::Round(($nowMs - [double]$r.t - $rtt / 2) / 1000)
+    if ([math]::Abs($skew) -gt 120) { [void]$f.Add(@{ id = 'time_skew'; sev = 'bad'; fix = 'sync_time'; p = @{ sec = $skew } }) }
+  } catch { }
+  # 6. DNS
+  try {
+    $checks++
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $dms = -1
+    try { [void][Net.Dns]::GetHostAddresses(([Uri]$Server).Host); $dms = [int]$sw.ElapsedMilliseconds } catch { }
+    if ($dms -lt 0 -or $dms -gt 800) { [void]$f.Add(@{ id = 'dns_slow'; sev = 'warn'; fix = 'flush_dns'; p = @{ ms = $dms } }) }
+  } catch { }
+  # 7. power plan "Power saver" makes the PC slow
+  try {
+    $checks++
+    $o = (powercfg /getactivescheme | Out-String)
+    if ($o -match 'a1841308-3541-4fab-bc81-f71556f20b4a') { [void]$f.Add(@{ id = 'power_saver'; sev = 'warn'; fix = 'power_balanced'; p = @{ x = 1 } }) }
+  } catch { }
+  # 8. pending reboot
+  try {
+    $checks++
+    if ((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
+      [void]$f.Add(@{ id = 'pending_reboot'; sev = 'warn'; fix = ''; p = @{ x = 1 } })
+    }
+  } catch { }
+  # 9. very long uptime, 10. low free RAM
+  if ($os) {
+    try {
+      $checks++
+      $days = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays)
+      if ($days -ge 14) { [void]$f.Add(@{ id = 'long_uptime'; sev = 'warn'; fix = ''; p = @{ days = $days } }) }
+    } catch { }
+    try {
+      $checks++
+      $usedPct = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize * 100)
+      if ($usedPct -ge 90) {
+        $big = [Diagnostics.Process]::GetProcesses() | Sort-Object WorkingSet64 -Descending | Select-Object -First 1
+        [void]$f.Add(@{ id = 'ram_high'; sev = 'warn'; fix = ''; p = @{ usedPct = $usedPct; name = [string]$big.ProcessName; mb = [math]::Round($big.WorkingSet64 / 1MB) } })
+      }
+    } catch { }
+  }
+  # 11. a process hogging the CPU (sampled with .NET, no WMI): 2 snapshots 2 seconds apart
+  try {
+    $checks++
+    $cores = [Math]::Max(1, [Environment]::ProcessorCount)
+    $snap = @{}
+    foreach ($p in [Diagnostics.Process]::GetProcesses()) { try { $snap[$p.Id] = @{ n = $p.ProcessName; t = $p.TotalProcessorTime.TotalMilliseconds } } catch { } }
+    $w = [Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Seconds 2
+    $best = $null
+    foreach ($p in [Diagnostics.Process]::GetProcesses()) {
+      try {
+        if ($snap.ContainsKey($p.Id)) {
+          $pc = [math]::Round(($p.TotalProcessorTime.TotalMilliseconds - $snap[$p.Id].t) / ($w.Elapsed.TotalMilliseconds * $cores) * 100, 1)
+          if ($p.Id -ne 0 -and $p.ProcessName -ne 'Idle' -and (-not $best -or $pc -gt $best.pct)) { $best = @{ name = $p.ProcessName; pid = $p.Id; pct = $pc } }
+        }
+      } catch { }
+    }
+    if ($best -and $best.pct -ge 30) { [void]$f.Add(@{ id = 'cpu_hog'; sev = 'warn'; fix = ''; p = $best }) }
+  } catch { }
+
+  return @{ findings = @($f); checks = $checks; took = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) }
+}
+
+# The ONLY things the dashboard can ask the agent to repair. Each is a fixed, reversible-or-harmless action.
+function Invoke-Fix([string]$id) {
+  $res = @{ id = $id; ok = $false; msg = ''; freedMb = 0 }
+  try {
+    switch ($id) {
+      'clean_temp' {
+        # only files older than 1 day inside Windows\Temp and each user's Temp folder (locked files are skipped)
+        $before = Get-TempBytes
+        $cut = (Get-Date).AddDays(-1)
+        foreach ($p in (Get-TempDirs)) {
+          Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut } | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+        $after = Get-TempBytes
+        $res.freedMb = [math]::Max(0, [math]::Round(($before - $after) / 1MB)); $res.ok = $true; $res.msg = 'cleaned'
+      }
+      'start_services' {
+        $out = @()
+        foreach ($n in @('WiFree3', 'ContentBlockerAgent', 'tvnserver', 'SionyxInputInjector', 'Dnscache', 'Winmgmt')) {
+          $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+          if ($s -and $s.StartType -ne 'Disabled' -and $s.Status -ne 'Running') {
+            if ($s.Status -eq 'Paused') { sc.exe continue $n | Out-Null } else { Start-Service -Name $n -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 2
+            $s.Refresh(); $out += ($n + '=' + $s.Status)
+          }
+        }
+        $res.ok = $true; $res.msg = ($out -join ', ')
+      }
+      'sync_time' {
+        Start-Service w32time -ErrorAction SilentlyContinue
+        $o = (w32tm /resync /force | Out-String).Trim()
+        $res.ok = ($LASTEXITCODE -eq 0); $res.msg = $o
+      }
+      'flush_dns' {
+        ipconfig /flushdns | Out-Null
+        try { Clear-DnsClientCache } catch { }
+        $res.ok = $true; $res.msg = 'dns cache cleared'
+      }
+      'repair_wmi' {
+        winmgmt /salvagerepository | Out-Null
+        winmgmt /resyncperf | Out-Null
+        $res.ok = $true; $res.msg = 'wmi repository checked, performance counters resynced'
+      }
+      'power_balanced' {
+        powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e | Out-Null
+        $res.ok = ($LASTEXITCODE -eq 0); $res.msg = 'power plan set to Balanced'
+      }
+      default { $res.msg = 'unknown fix' }
+    }
+  } catch { $res.msg = 'error: ' + $_.Exception.Message }
+  if ($res.msg.Length -gt 180) { $res.msg = $res.msg.Substring(0, 180) }
+  return $res
+}
+$script:FixQueue = New-Object 'System.Collections.Generic.Queue[string]'
+$script:DiagResult = $null
+$script:FixResults = @()
+$script:FixIds = @('clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced')
+function Start-DiagJob {
+  $k = $Key.Replace("'", "''"); $sv = $Server.Replace("'", "''")
+  $prefix = "`$Server = '$sv'; `$Key = '$k'; `$Headers = @{ 'x-agent-key' = `$Key }"
+  Start-BgJob 'diag' (Build-JobScript @('Get-TempDirs', 'Get-TempBytes', 'Get-Diagnosis') $prefix 'Get-Diagnosis')
+}
+function Start-NextFix {
+  if ($script:BgJobs.ContainsKey('fix') -or $script:FixQueue.Count -eq 0) { return }
+  $id = $script:FixQueue.Dequeue()
+  if ($script:FixIds -notcontains $id) { Log "fix refused (not in whitelist): $id"; return }
+  Log "running fix: $id"
+  Start-BgJob 'fix' (Build-JobScript @('Get-TempDirs', 'Get-TempBytes', 'Invoke-Fix') '' "Invoke-Fix '$id'")
 }
 
 # Makes sure the scheduled task also has a repeating "start if not running" trigger, so the agent
@@ -415,9 +616,11 @@ function Beat([bool]$busy) {
     if ($script:SysInfo) { $b.sysinfo = $script:SysInfo; $script:SysInfo = $null }
     if ($script:KillResult) { $b.killResult = $script:KillResult; $script:KillResult = $null }
     if ($script:NetInfo) { $b.netinfo = $script:NetInfo; $script:NetInfo = $null }
+    if ($script:DiagResult) { $b.diag = $script:DiagResult; $script:DiagResult = $null }
+    if ($script:FixResults.Count -gt 0) { $b.fixResults = @($script:FixResults); $script:FixResults = @() }
     if ($script:LogTail) { $b.logTail = $script:LogTail; $script:LogTail = $null }
     if ($script:LastRtt -ne $null) { $b.rttMs = $script:LastRtt }   # round-trip of the PREVIOUS heartbeat
-    $body = $b | ConvertTo-Json -Compress -Depth 4
+    $body = $b | ConvertTo-Json -Compress -Depth 8
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $resp = Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
     $script:LastRtt = [int]$sw.ElapsedMilliseconds
@@ -611,6 +814,7 @@ Log "agent started: computer $ComputerNumber -> $Server"
 Ensure-Watchdog
 while ($true) {
   Poll-BgJobs
+  Start-NextFix
   Refresh-Stats
   $r = Beat $false
   Handle-Reply $r

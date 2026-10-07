@@ -82,6 +82,7 @@
   .tag.ok { background:rgba(22,163,74,.14); color:var(--ok); } .tag.warn { background:rgba(217,119,6,.15); color:var(--busy); }
   .row { display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
   .row .primary { flex:1; }
+  .row .half { flex:1 1 calc(50% - 6px); font-weight:600; order:5; }
   .row .wide { flex:1 1 100%; order:5; font-weight:600; }
   .small { padding:6px 9px; font-size:12px; }
   select.small { border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--text); max-width:120px; cursor:pointer; }
@@ -196,7 +197,7 @@
     <button class="f" id="selAll" title="סמן את כל המחשבים המחוברים (לפי הסינון)">&#9745; בחר מחוברים</button>
     <div id="bulk">
       <b id="bulkN"></b>
-      <select id="bulkAct"><option value="">פעולה לנבחרים...</option><option value="lock">נעילה</option><option value="logoff">התנתקות משתמש</option><option value="restart">אתחול</option><option value="shutdown">כיבוי</option><option value="restartfilter">הפעל מחדש שירותי סינון</option></select>
+      <select id="bulkAct"><option value="">פעולה לנבחרים...</option><option value="lock">נעילה</option><option value="logoff">התנתקות משתמש</option><option value="restart">אתחול</option><option value="shutdown">כיבוי</option><option value="restartfilter">הפעל מחדש שירותי סינון</option><option value="diagnose">🩺 סרוק בעיות</option></select>
       <button class="small primary" id="bulkGo" type="button">בצע</button>
       <button class="small" id="bulkClear" type="button">נקה</button>
     </div>
@@ -285,11 +286,12 @@ function makeCard(c) {
   for (const [v, t] of [['', '\u22EF עוד...'], ['rename', 'שינוי שם'], ['getlog', 'יומן סוכן'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['restart', 'אתחול'], ['shutdown', 'כיבוי'], ['restartfilter', 'הפעל מחדש שירותי סינון'], ['forget', 'הסר מהרשימה'], ['uninstall', 'הסר תוכנה מהמחשב']]) {
     const o = el('option', null, t); o.value = v; cmd.appendChild(o);
   }
-  const sys = el('button', 'small wide', '\u{1F4CA} פרטי מחשב'); sys.title = 'דגם המעבד, מה מעמיס עליו כרגע, ואפשרות לסיים תהליכים';
-  row.append(go, cmd, sys);
+  const sys = el('button', 'small half', '\u{1F4CA} פרטי מחשב'); sys.title = 'דגם המעבד, מה מעמיס עליו כרגע, ואפשרות לסיים תהליכים';
+  const rep_ = el('button', 'small half', '\u{1FA7A} בדוק ותקן'); rep_.title = 'סורק את המחשב לבעיות נפוצות (איטיות, דיסק מלא, שירותים כבויים, שעון...) ומציע תיקונים';
+  row.append(go, cmd, sys, rep_);
   card.append(top, sub, seen, note, gauges, tags, row);
   card.addEventListener('animationend', () => card.classList.remove('enter'), { once: true });
-  const entry = { el: card, c, refs: { numTxt, sel, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, sys } };
+  const entry = { el: card, c, refs: { numTxt, sel, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, sys, rep: rep_ } };
   go.onclick = () => connect(entry.c, go);
   numTxt.onclick = () => rename(entry.c);
   sel.onchange = () => { if (sel.checked) selected.add(entry.c.number); else selected.delete(entry.c.number); updateBulk(); };
@@ -298,6 +300,7 @@ function makeCard(c) {
     if (v === 'rename') rename(entry.c); else if (v === 'forget') forget(entry.c); else if (v === 'getlog') openLog(entry.c); else sendCommand(entry.c, v);
   };
   sys.onclick = () => openSysInfo(entry.c, sys);
+  rep_.onclick = () => openRepair(entry.c);
   return entry;
 }
 
@@ -326,11 +329,13 @@ function paint(entry, c) {
     if (st.uptimeHours != null) tag('\u23F1 ' + (st.uptimeHours < 1 ? Math.round(st.uptimeHours * 60) + ' דק׳' : st.uptimeHours + ' שע׳'));
     if (c.rttMs != null) tag('\u{1F4F6} ' + c.rttMs + ' ms', c.rttMs < 300 ? '' : 'warn');
     tag(st.vnc ? '\u2714 VNC מוכן' : '\u26A0 VNC לא זמין', st.vnc ? 'ok' : 'warn');
+    if (c.diagAt && c.diagCount != null && Date.now() - c.diagAt < 6 * 3600e3) tag(c.diagCount ? '\u{1FA7A} ' + c.diagCount + ' בעיות' : '\u{1FA7A} תקין', c.diagCount ? 'warn' : 'ok');
     if (!c.upToDate) tag('\u2B06 ממתין לעדכון סוכן', 'warn');
   }
   r.go.disabled = !c.online || c.uninstalling;
   r.cmd.disabled = c.uninstalling;
   r.sys.disabled = !c.online || c.uninstalling;
+  r.rep.disabled = !c.online || c.uninstalling;
   // offline computers can only be renamed or removed from the list; online ones can't be "removed from list"
   for (const o of r.cmd.options) { if (!o.value) continue; o.disabled = o.value === 'rename' ? false : o.value === 'forget' ? c.online : !c.online; }
   r.sel.disabled = !c.online; r.sel.checked = c.online && selected.has(c.number);
@@ -375,6 +380,8 @@ async function refresh() {
     checkKillWatch();
     checkNetWatch();
     checkLogWatch();
+    checkRepairWatch();
+    checkFixWatch();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
 
@@ -700,7 +707,7 @@ $('bulkGo').onclick = async () => {
 const EV_ICON = { down: '\u274C', up: '\u2705', cpu: '\u{1F525}', cmd: '\u2699\uFE0F', info: '\u2139\uFE0F' };
 const fmtTime = (t) => new Date(t).toLocaleString('he-IL', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 async function openEvents() {
-  stopSysLoad(); sysWatch = null;
+  stopSysLoad(); sysWatch = null; repairWatch = null;
   $('sysModal').classList.remove('hidden');
   $('sysTitle').textContent = '\u{1F514} אירועים והתראות';
   $('sysBody').innerHTML = '<div class="sysLoading">טוען...</div>';
@@ -768,6 +775,129 @@ function drawHist(box, samples, step) {
     <path d="${path(2)}" fill="none" stroke="#d97706" stroke-width="1.6" stroke-linejoin="round"/>
     <path d="${path(1)}" fill="none" stroke="#2f6fed" stroke-width="1.8" stroke-linejoin="round"/></svg>
     <div class="hLeg"><span><i style="background:#2f6fed"></i>מעבד (ממוצע ${avg}%, שיא ${max}%)</span><span><i style="background:#d97706"></i>זיכרון</span><span>רווח בקו = המחשב לא היה מחובר</span></div>`;
+}
+
+// ---------- check & repair ----------
+const SEV_ICON = { bad: '\u{1F534}', warn: '\u{1F7E0}', ok: '\u{1F7E2}' };
+const fmtSkew = (sec) => { const a = Math.abs(sec); return a >= 3600 ? Math.round(a / 3600) + ' שעות' : a >= 60 ? Math.round(a / 60) + ' דקות' : a + ' שניות'; };
+const DIAG = {
+  disk_low: { t: (p) => `שטח הדיסק נמוך: ${p.freeGb} GB פנוי מתוך ${p.totalGb} GB (${p.pct}%)`, d: 'דיסק כמעט מלא מאט את Windows ויכול למנוע עדכונים. הניקוי מוחק רק קבצים זמניים ישנים (מעל יום).' },
+  temp_big: { t: (p) => `יש ${p.mb} MB של קבצים זמניים ישנים`, d: 'קבצים זמניים שנשארו מתוכנות. אפשר למחוק אותם בבטחה.' },
+  wmi_slow: { t: (p) => p.ms < 0 ? 'שירות הניטור של Windows (WMI) לא עונה' : `שירות הניטור של Windows (WMI) איטי (${p.ms} ms)`, d: 'כשהוא איטי או פגום, פרטי מחשב וכלי ניטור נתקעים. התיקון בודק את מאגר ה-WMI ומסנכרן מחדש את מוני הביצועים.' },
+  svc_stopped: { t: (p) => `שירותים חשובים לא רצים: ${p.names}`, d: 'בלי השירותים האלה השליטה מרחוק או הסינון עלולים לא לעבוד. התיקון מפעיל אותם.' },
+  time_skew: { t: (p) => `השעון במחשב לא מדויק: הפרש של ${fmtSkew(p.sec)} מול השרת`, d: 'שעון שגוי שובר חיבורים מוצפנים (HTTPS) והתחברויות. התיקון מסנכרן את השעון.' },
+  dns_slow: { t: (p) => p.ms < 0 ? 'ה-DNS לא מצליח לפענח את שם השרת' : `ה-DNS איטי (${p.ms} ms)`, d: 'פענוח שמות איטי גורם לאתרים להיטען לאט. התיקון מנקה את מטמון ה-DNS.' },
+  power_saver: { t: () => 'תוכנית החשמל היא "חיסכון באנרגיה"', d: 'התוכנית הזו מאטה את המעבד בכוונה. התיקון עובר לתוכנית "מאוזן".' },
+  pending_reboot: { t: () => 'Windows מחכה לאתחול', d: 'עדכון או התקנה לא הושלמו עד שיתבצע אתחול, וזה גורם לאיטיות. מומלץ לאתחל.', act: 'restart' },
+  long_uptime: { t: (p) => `המחשב דלוק ${p.days} ימים בלי אתחול`, d: 'אתחול מנקה תהליכים תקועים ומשלים עדכונים.', act: 'restart' },
+  ram_high: { t: (p) => `הזיכרון כמעט מלא (${p.usedPct}%)`, d: (p) => `התהליך הגדול ביותר: ${p.name} (${p.mb} MB). סגירת התוכנה או אתחול יעזרו.`, act: 'restart' },
+  cpu_hog: { t: (p) => `${p.name} מעמיס על המעבד (${p.pct}%)`, d: 'אם התוכנה לא נחוצה אפשר לסיים אותה מכאן. תהליכי מערכת מוגנים ולא יסתיימו.', act: 'kill' },
+};
+const FIX_INFO = {
+  clean_temp: { l: 'נקה קבצים זמניים', c: 'למחוק קבצים זמניים ישנים (מעל יום) מתיקיות Temp של Windows והמשתמשים?' },
+  start_services: { l: 'הפעל שירותים', c: 'להפעיל את השירותים שנעצרו (סינון, VNC ושירותי מערכת חשובים)?' },
+  sync_time: { l: 'סנכרן שעון', c: 'לסנכרן את שעון המחשב?' },
+  flush_dns: { l: 'נקה DNS', c: 'לנקות את מטמון ה-DNS?' },
+  repair_wmi: { l: 'תקן WMI', c: 'לבדוק ולתקן את מאגר ה-WMI ולסנכרן מוני ביצועים? זה לא מאתחל את המחשב.' },
+  power_balanced: { l: 'תוכנית "מאוזן"', c: 'להחליף את תוכנית החשמל ל"מאוזן"?' },
+};
+let repairWatch = null, fixWatch = null;
+const REPAIR_WAIT_MS = 90000;
+
+function openRepair(c) {
+  stopSysLoad(); sysWatch = null; logWatch = null;
+  $('sysModal').classList.remove('hidden');
+  $('sysTitle').textContent = '\u{1FA7A} בדיקה ותיקון - מחשב ' + c.number;
+  startScan(c);
+}
+function startScan(c) {
+  startSysLoad();
+  repairWatch = { number: c.number, requestedAt: Date.now() };
+  api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action: 'diagnose' } })
+    .catch((e) => { stopSysLoad(); repairWatch = null; $('sysBody').innerHTML = `<div class="sysLoading">${e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב לא מחובר' : 'שגיאה: ' + esc(e.message)}</div>`; });
+}
+function checkRepairWatch() {
+  if (!repairWatch) return;
+  const c = data.find((x) => x.number === repairWatch.number); if (!c) { repairWatch = null; return; }
+  const fresh = c.diagAt && c.diagAt >= repairWatch.requestedAt;
+  if (!fresh && Date.now() - repairWatch.requestedAt < REPAIR_WAIT_MS) return;
+  repairWatch = null; stopSysLoad();
+  if ($('sysModal').classList.contains('hidden')) return;
+  if (!fresh) { $('sysBody').innerHTML = '<div class="sysLoading">המחשב לא החזיר תוצאות בזמן (הסריקה לוקחת עד כדקה). ייתכן שהוא עמוס מאוד. אפשר לנסות שוב.</div>'; return; }
+  showDiag(c);
+}
+async function showDiag(c) {
+  try {
+    const r = await api(`/computers/${encodeURIComponent(c.number)}/diag`);
+    if ($('sysModal').classList.contains('hidden')) return;
+    renderRepair(c, r.diag);
+  } catch (e) { $('sysBody').innerHTML = '<div class="sysLoading">שגיאה בטעינת התוצאות</div>'; }
+}
+function renderRepair(c, diag) {
+  const body = $('sysBody');
+  if (!diag) { body.innerHTML = '<div class="sysLoading">אין תוצאות.</div>'; return; }
+  const list = diag.findings.slice().sort((a, b) => (a.sev === 'bad' ? 0 : 1) - (b.sev === 'bad' ? 0 : 1));
+  const fixIds = [...new Set(list.map((f) => f.fix).filter(Boolean))];
+  let html = '';
+  if (!list.length) {
+    html += `<div class="sysInsight ok">\u2705 לא נמצאו בעיות (נבדקו ${diag.checks} בדיקות תוך ${diag.took} שניות).</div>`;
+  } else {
+    html += `<div class="sysInsight">נבדקו ${diag.checks} בדיקות ונמצאו <b>${list.length}</b> ממצאים.${fixIds.length ? ' <button id="fixAll" class="small primary" type="button">\u{1F527} תקן הכל (' + fixIds.length + ')</button>' : ''}</div>`;
+    html += list.map((f) => {
+      const m = DIAG[f.id] || { t: () => f.id, d: '' };
+      const desc = typeof m.d === 'function' ? m.d(f.p) : m.d;
+      let btns = '';
+      if (f.fix) btns += `<button class="small primary" data-fix="${esc(f.fix)}" type="button">${esc((FIX_INFO[f.fix] || {}).l || 'תקן')}</button> `;
+      if (m.act === 'restart') btns += '<button class="small" data-act="restart" type="button">אתחל עכשיו</button>';
+      if (m.act === 'kill' && f.p.pid) btns += `<button class="small kill" data-act="kill" data-pid="${f.p.pid}" data-name="${esc(f.p.name)}" type="button">סיים תהליך</button>`;
+      return `<div class="evRow" style="align-items:flex-start"><span>${SEV_ICON[f.sev] || ''}</span><div style="flex:1"><b>${esc(m.t(f.p))}</b><div class="sysSub2" style="margin:2px 0 6px">${esc(desc)}</div>${btns}</div></div>`;
+    }).join('');
+  }
+  html += '<div style="margin-top:14px"><button id="rescan" class="small" type="button">\u{1F504} סרוק שוב</button></div>';
+  body.innerHTML = html;
+  body.querySelectorAll('button[data-fix]').forEach((b) => { b.onclick = () => applyFixes(c, [b.dataset.fix]); });
+  const fa = $('fixAll'); if (fa) fa.onclick = () => applyFixes(c, fixIds);
+  body.querySelectorAll('button[data-act]').forEach((b) => {
+    b.onclick = async () => {
+      if (b.dataset.act === 'restart') { await sendCommand(c, 'restart'); return; }
+      const name = b.dataset.name;
+      if (!confirm(`לסיים את התהליך "${name}" במחשב ${c.number}?\nעבודה לא שמורה בתוכנה הזו תאבד.`)) return;
+      try { await api(`/computers/${encodeURIComponent(c.number)}/kill`, { method: 'POST', body: { pid: Number(b.dataset.pid), name } }); toast('הבקשה נשלחה. סרוק שוב בעוד רגע כדי לוודא.', 'ok'); }
+      catch (e) { toast(e.message === 'agent_outdated' ? OUTDATED_MSG : 'שגיאה: ' + e.message, 'err'); }
+    };
+  });
+  $('rescan').onclick = () => startScan(c);
+}
+async function applyFixes(c, ids) {
+  const text = ids.map((id) => '\u2022 ' + ((FIX_INFO[id] || {}).c || id)).join('\n');
+  if (!confirm(`לבצע במחשב ${c.number}:\n\n${text}`)) return;
+  try { await api(`/computers/${encodeURIComponent(c.number)}/fix`, { method: 'POST', body: { ids } }); }
+  catch (e) { toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב לא מחובר' : 'שגיאה: ' + e.message, 'err'); return; }
+  fixWatch = { number: c.number, requestedAt: Date.now(), ids: ids.slice() };
+  $('sysBody').innerHTML = '<div class="waitBox"><div class="waitSpin"></div><div class="waitStep">מתקן...</div><div class="waitSec">התיקונים רצים אחד אחרי השני במחשב (עד כמה דקות). אפשר להשאיר את החלון פתוח.</div></div>';
+}
+async function checkFixWatch() {
+  if (!fixWatch) return;
+  const w = fixWatch;
+  const c = data.find((x) => x.number === w.number); if (!c) { fixWatch = null; return; }
+  const timedOut = Date.now() - w.requestedAt > 5 * 60 * 1000;
+  if (!(c.fixAt && c.fixAt >= w.requestedAt) && !timedOut) return;
+  let results = [];
+  try { const r = await api(`/computers/${encodeURIComponent(w.number)}/diag`); results = (r.fixResults || []).filter((x) => x.at >= w.requestedAt - 1000 && w.ids.includes(x.id)); } catch (e) { return; }
+  const done = new Set(results.map((x) => x.id));
+  if (!w.ids.every((id) => done.has(id)) && !timedOut) return;
+  if (fixWatch !== w) return;
+  fixWatch = null;
+  if ($('sysModal').classList.contains('hidden')) { toast(`התיקונים במחשב ${w.number} הסתיימו`, 'ok'); return; }
+  const rows = w.ids.map((id) => {
+    const r = results.find((x) => x.id === id);
+    const label = (FIX_INFO[id] || {}).l || id;
+    if (!r) return `<div class="evRow"><span>\u23F3</span><span><b>${esc(label)}</b>: לא התקבלה תשובה מהמחשב</span></div>`;
+    const extra = id === 'clean_temp' && r.ok ? ` - שוחררו ${r.freedMb} MB` : r.msg && !r.ok ? ' - ' + esc(r.msg) : '';
+    return `<div class="evRow"><span>${r.ok ? '\u2705' : '\u274C'}</span><span><b>${esc(label)}</b>: ${r.ok ? 'בוצע' : 'נכשל'}${extra}</span></div>`;
+  }).join('');
+  $('sysBody').innerHTML = '<div class="netHead"><span>תוצאות התיקון</span></div>' + rows + '<div style="margin-top:14px"><button id="rescan2" class="small primary" type="button">\u{1F504} סרוק שוב לאימות</button></div>';
+  $('rescan2').onclick = () => startScan(c);
 }
 
 $('q').addEventListener('input', render);
