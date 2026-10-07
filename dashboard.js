@@ -205,7 +205,13 @@ const view = (c) => ({
 // ---- routes ----
 const router = express.Router();
 router.use((_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
-router.use(express.json({ limit: '10kb' }));
+// Basic hardening headers for everything this router serves.
+router.use((_req, res, next) => {
+  res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' });
+  next();
+});
+// 64kb: one heartbeat can carry stats + sysinfo + network test + diagnosis + a 40-line log together.
+router.use(express.json({ limit: '64kb' }));
 
 router.post('/login', (req, res) => {
   if (!DASHBOARD_PASSWORD) return res.status(503).json({ error: 'DASHBOARD_PASSWORD is not set on the server' });
@@ -367,6 +373,7 @@ router.post('/agent/heartbeat', (req, res) => {
   }
   c.hostname = String(body.hostname || '').slice(0, 64);
   c.lastSeen = now;
+  c.liveSinceBoot = true;   // seen alive since this server started (used so permanently-dead computers do not re-alert after every deploy)
   c.busy = !!body.busy;
   const st = cleanStats(body.stats);
   if (st) c.stats = st;
@@ -518,7 +525,7 @@ async function monitorTick() {
   for (const c of computers.values()) {
     if (!c.lastSeen) continue;
     const age = now - c.lastSeen;
-    if (age >= DOWN_MS && !c.downAlerted && now - bootAt > DOWN_MS) {       // grace after a server restart: agents need time to come back
+    if (age >= DOWN_MS && !c.downAlerted && c.liveSinceBoot && now - bootAt > DOWN_MS) {       // grace after a server restart: agents need time to come back
       c.downAlerted = true; c.downSince = c.lastSeen; c.hiSince = null;
       addEvent(c.number, 'down', 'המחשב לא מחובר כבר 5 דקות'); downs.push(c);
     } else if (age < ONLINE_MS && c.downAlerted) {
@@ -578,7 +585,7 @@ module.exports = function mount(app) {
   if (!DASHBOARD_PASSWORD) console.warn('[dash] WARNING: DASHBOARD_PASSWORD is not set - dashboard login is disabled');
   if (!AGENT_KEY) console.warn('[dash] WARNING: AGENT_KEY is not set - agents cannot register');
   app.use('/api', router);
-  app.get('/dashboard', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
+  app.get('/dashboard', (_req, res) => res.set({ 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' }).sendFile(path.join(__dirname, 'public', 'dashboard.html')));
   app.get('/sionyx-agent.ps1', (_req, res) => {
     res.type('text/plain; charset=utf-8').sendFile(path.join(__dirname, 'public', 'sionyx-agent.ps1'));
   });
