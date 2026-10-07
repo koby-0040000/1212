@@ -24,13 +24,14 @@ const VNC_PASSWORD = process.env.VNC_PASSWORD || '';
 const SECRET = process.env.SESSION_SECRET
   || crypto.createHash('sha256').update(`sionyx-dash|${DASHBOARD_PASSWORD}|${AGENT_KEY}`).digest('hex');
 
+const DOWN_MS = 5 * 60 * 1000;     // no heartbeat this long => really down (alert); between ONLINE_MS and this = "reconnecting"
 const ONLINE_MS = 45000;            // no heartbeat for this long => offline
 const COOKIE = 'sx_dash';
 const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
-const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest']);
+const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest', 'getlog', 'restartfilter']);
 
 // Version fingerprint of the agent script this server is serving (normalised, ASCII). Agents report
 // the fingerprint of the script they are running, so the dashboard can show who still needs the update.
@@ -156,9 +157,13 @@ function cleanNetInfo(n) {
 }
 
 const isOnline = (c) => !!c.lastSeen && Date.now() - c.lastSeen < ONLINE_MS;
+// online | unstable (missed heartbeats for under 5 minutes: usually a network blip) | offline
+const connState = (c) => (isOnline(c) ? 'online' : c.lastSeen && Date.now() - c.lastSeen < DOWN_MS ? 'unstable' : 'offline');
+const isCurrent = (c) => !!(AGENT_VER && c.stats && c.stats.ver === AGENT_VER);
 const view = (c) => ({
   number: c.number, name: c.name || '', hostname: c.hostname || '',
-  online: isOnline(c), busy: isOnline(c) && !!c.busy,
+  online: isOnline(c), connState: connState(c), busy: isOnline(c) && !!c.busy,
+  logAt: c.logAt || null,
   // "removing..." only while the computer has not come back with a heartbeat after the command;
   // if it is still alive 20s later the removal did not happen -> report a failure instead of hanging.
   uninstalling: !!c.uninstallAt && Date.now() - c.uninstallAt < UNINSTALL_WAIT_MS && !(c.lastSeen > c.uninstallAt + UNINSTALL_ALIVE_MS),
@@ -200,6 +205,7 @@ router.get('/computers', requireAuth, (_req, res) => {
     serverTime: Date.now(),
     total: list.length,
     online: list.filter((c) => c.online).length,
+    unstable: list.filter((c) => c.connState === 'unstable').length,
     computers: list,
   });
 });
@@ -221,11 +227,9 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   if (!isOnline(c)) return res.status(409).json({ error: 'offline' });
   const action = String((req.body && req.body.action) || '');
   if (!COMMANDS.has(action)) return res.status(400).json({ error: 'unknown action' });
-  c.commands = (c.commands || []).slice(-4);
-  c.commands.push({ action, at: Date.now() });
-  // sysinfo/nettest only on an agent that runs the current script: older versions run them inline and can
-  // freeze the whole agent (computer then shows as not connected) on slow or broken-WMI computers.
-  if ((action === 'sysinfo' || action === 'nettest') && !(AGENT_VER && c.stats && c.stats.ver === AGENT_VER)) {
+  // These need the current agent script: older versions run heavy work inline and can freeze the whole agent
+  // (computer then shows as not connected) on slow or broken-WMI computers, or do not know the command at all.
+  if (['sysinfo', 'nettest', 'getlog', 'restartfilter'].includes(action) && !isCurrent(c)) {
     return res.status(409).json({ error: 'agent_outdated' });
   }
   if (action === 'uninstall') {
@@ -233,6 +237,9 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
     if (!c.stats || Number(c.stats.agent) < 3) return res.status(409).json({ error: 'agent_outdated' });
     c.uninstallAt = Date.now();
   }
+  c.commands = (c.commands || []).slice(-4);
+  c.commands.push({ action, at: Date.now() });
+  if (!['sysinfo', 'nettest', 'getlog'].includes(action)) addEvent(c.number, 'cmd', 'פקודה: ' + action);
   console.log(`[dash] command ${action} queued for computer ${c.number}`);
   res.json({ ok: true });
 });
@@ -259,13 +266,14 @@ router.post('/computers/:number/kill', requireAuth, (req, res) => {
   const c = computers.get(req.params.number);
   if (!c) return res.status(404).json({ error: 'unknown computer' });
   if (!isOnline(c)) return res.status(409).json({ error: 'offline' });
-  if (!(AGENT_VER && c.stats && c.stats.ver === AGENT_VER)) return res.status(409).json({ error: 'agent_outdated' });
+  if (!isCurrent(c)) return res.status(409).json({ error: 'agent_outdated' });
   const pid = Number(req.body && req.body.pid);
   const name = String((req.body && req.body.name) || '');
   if (!Number.isInteger(pid) || pid <= 4 || pid > 4194304) return res.status(400).json({ error: 'bad pid' });
   if (!/^[\w .()\-]{1,60}$/.test(name)) return res.status(400).json({ error: 'bad name' });
   c.kills = (c.kills || []).slice(-4);
   c.kills.push({ pid, name, at: Date.now() });
+  addEvent(c.number, 'cmd', `סיום תהליך ${name} (${pid})`);
   console.log(`[dash] kill ${name} (${pid}) queued for computer ${c.number}`);
   res.json({ ok: true });
 });
@@ -322,6 +330,7 @@ router.post('/agent/heartbeat', (req, res) => {
   if (typeof body.rttMs === 'number' && body.rttMs >= 0 && body.rttMs < 60000) { c.rttMs = Math.round(body.rttMs); c.rttAt = now; }
   const ni = cleanNetInfo(body.netinfo);
   if (ni) { c.netinfo = ni; c.netinfoAt = now; }
+  if (typeof body.logTail === 'string') { c.logTail = body.logTail.slice(-8000); c.logAt = now; }
   const kr = body.killResult;
   if (kr && typeof kr === 'object') {
     c.killResult = { pid: Number(kr.pid) || 0, name: String(kr.name || '').slice(0, 60), ok: !!kr.ok, msg: String(kr.msg || '').slice(0, 120) };
@@ -353,6 +362,160 @@ router.post('/agent/uninstalled', (req, res) => {
   scheduleSave();
   console.log(`[dash] computer ${number} uninstalled the agent and was removed`);
   res.json({ ok: true });
+});
+
+// =====================================================================================
+// Events, 24h history, alerts, and durable state
+// =====================================================================================
+const HIST_STEP_MS = 2 * 60 * 1000;        // one history sample per computer every 2 minutes
+const HIST_KEEP = 720;                      // = 24 hours
+const EVENTS_KEEP = 300;
+const events = [];                          // newest last: { t, number, type: down|up|cpu|cmd|info, msg }
+const hist = new Map();                     // number -> [[t, cpu, ramPct, rttMs], ...]
+const bootAt = Date.now();
+
+function addEvent(number, type, msg) {
+  events.push({ t: Date.now(), number: String(number || ''), type, msg: String(msg).slice(0, 200) });
+  if (events.length > EVENTS_KEEP) events.splice(0, events.length - EVENTS_KEEP);
+  scheduleHistSave();
+}
+
+// ---- optional alerts: Telegram bot and/or a generic webhook (set env vars on Render) ----
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
+const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK_URL || '';
+const alertsConfigured = () => !!((TG_TOKEN && TG_CHAT) || ALERT_WEBHOOK);
+async function sendAlert(text) {
+  const jobs = [];
+  if (TG_TOKEN && TG_CHAT) {
+    jobs.push(fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text }),
+    }).then((r) => { if (!r.ok) throw new Error('telegram HTTP ' + r.status); }));
+  }
+  if (ALERT_WEBHOOK) {
+    jobs.push(fetch(ALERT_WEBHOOK, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, content: text }),
+    }).then((r) => { if (!r.ok) throw new Error('webhook HTTP ' + r.status); }));
+  }
+  const res = await Promise.allSettled(jobs);
+  res.forEach((r) => { if (r.status === 'rejected') console.error('[dash] alert failed:', r.reason && r.reason.message); });
+  return res.length > 0 && res.every((r) => r.status === 'fulfilled');
+}
+
+// ---- durable state: local file, plus Upstash Redis (free) when configured, so a Render deploy/restart
+// no longer wipes the computer list, names, history and events ----
+const KV_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+const KV_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const kvOn = () => !!(KV_URL && KV_TOKEN);
+async function kvGet(key) {
+  const r = await fetch(`${KV_URL}/get/${key}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
+  const j = await r.json(); return j && j.result ? JSON.parse(j.result) : null;
+}
+async function kvSet(key, val) {
+  const r = await fetch(`${KV_URL}/set/${key}`, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}` }, body: JSON.stringify(val) });
+  if (!r.ok) throw new Error('kv HTTP ' + r.status);
+}
+const HIST_FILE = path.join(DATA_DIR, 'history.json');
+let histTimer = null, kvCompAt = 0, kvHistAt = 0;
+function saveHistNow() {
+  const out = { events, hist: Object.fromEntries(hist) };
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(HIST_FILE, JSON.stringify(out)); } catch (e) { console.error('[dash] history save failed:', e.message); }
+  if (kvOn() && Date.now() - kvHistAt > 5 * 60 * 1000) { kvHistAt = Date.now(); kvSet('sionyx:history', out).catch((e) => console.error('[dash] kv history:', e.message)); }
+}
+function scheduleHistSave() { if (histTimer) return; histTimer = setTimeout(() => { histTimer = null; saveHistNow(); }, 60000); histTimer.unref(); }
+function kvSaveComputers() {
+  if (!kvOn() || Date.now() - kvCompAt < 2 * 60 * 1000) return;
+  kvCompAt = Date.now();
+  const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen }) => ({ number, name, hostname, firstSeen, lastSeen }));
+  kvSet('sionyx:computers', list).catch((e) => console.error('[dash] kv computers:', e.message));
+}
+function loadHistFile() {
+  try {
+    const o = JSON.parse(fs.readFileSync(HIST_FILE, 'utf8'));
+    if (Array.isArray(o.events)) events.push(...o.events.slice(-EVENTS_KEEP));
+    for (const [k, v] of Object.entries(o.hist || {})) if (Array.isArray(v)) hist.set(k, v.slice(-HIST_KEEP));
+  } catch { /* first run */ }
+}
+loadHistFile();
+if (kvOn()) {
+  (async () => {
+    try {
+      const comps = await kvGet('sionyx:computers');
+      let added = 0;
+      for (const c of comps || []) if (c && c.number && !computers.has(c.number)) { computers.set(c.number, { ...c, busy: false, pending: null }); added++; }
+      const h = await kvGet('sionyx:history');
+      if (h && !events.length && !hist.size) {
+        if (Array.isArray(h.events)) events.push(...h.events.slice(-EVENTS_KEEP));
+        for (const [k, v] of Object.entries(h.hist || {})) if (Array.isArray(v)) hist.set(k, v.slice(-HIST_KEEP));
+      }
+      console.log(`[dash] restored ${added} computer(s) from Upstash`);
+    } catch (e) { console.error('[dash] Upstash restore failed:', e.message); }
+  })();
+}
+
+// ---- monitor: connection state changes -> events/alerts, and 24h history samples ----
+let lastSample = 0;
+async function monitorTick() {
+  const now = Date.now();
+  const downs = [], ups = [], hots = [];
+  for (const c of computers.values()) {
+    if (!c.lastSeen) continue;
+    const age = now - c.lastSeen;
+    if (age >= DOWN_MS && !c.downAlerted && now - bootAt > DOWN_MS) {       // grace after a server restart: agents need time to come back
+      c.downAlerted = true; c.downSince = c.lastSeen; c.hiSince = null;
+      addEvent(c.number, 'down', 'המחשב לא מחובר כבר 5 דקות'); downs.push(c);
+    } else if (age < ONLINE_MS && c.downAlerted) {
+      c.downAlerted = false;
+      const mins = Math.max(1, Math.round((now - (c.downSince || now)) / 60000));
+      addEvent(c.number, 'up', `המחשב חזר לאחר כ-${mins} דקות`); ups.push({ c, mins });
+    }
+    const cpu = c.stats && c.stats.cpuPct;
+    if (age < ONLINE_MS && cpu != null && cpu >= 90) {
+      c.hiSince = c.hiSince || now;
+      if (now - c.hiSince >= 10 * 60 * 1000 && !c.hiAlerted) { c.hiAlerted = true; addEvent(c.number, 'cpu', `עומס מעבד גבוה (${cpu}%) כבר 10 דקות`); hots.push(c); }
+    } else if (cpu != null && cpu < 70) { c.hiSince = null; c.hiAlerted = false; }
+  }
+  if (now - lastSample >= HIST_STEP_MS) {
+    lastSample = now;
+    for (const c of computers.values()) {
+      if (!isOnline(c) || !c.stats) continue;
+      const st = c.stats;
+      const ram = st.ramTotalGb && st.ramFreeGb != null ? Math.round((st.ramTotalGb - st.ramFreeGb) / st.ramTotalGb * 100) : null;
+      const arr = hist.get(c.number) || []; arr.push([now, st.cpuPct, ram, c.rttMs != null ? c.rttMs : null]);
+      if (arr.length > HIST_KEEP) arr.splice(0, arr.length - HIST_KEEP);
+      hist.set(c.number, arr);
+    }
+    scheduleHistSave();
+  }
+  kvSaveComputers();
+  // one batched message per tick; several computers down together usually means a network/power problem, not 5 separate faults
+  const lines = [];
+  if (downs.length >= 3) lines.push(`\u26A0\uFE0F ${downs.length} מחשבים לא מחוברים: ${downs.map((c) => c.number).join(', ')}\nייתכן שהבעיה ברשת, בחשמל או בשרת.`);
+  else downs.forEach((c) => lines.push(`\u274C מחשב ${c.number}${c.name ? ' (' + c.name + ')' : ''} לא מחובר כבר 5 דקות`));
+  ups.forEach(({ c, mins }) => lines.push(`\u2705 מחשב ${c.number}${c.name ? ' (' + c.name + ')' : ''} חזר אחרי כ-${mins} דקות`));
+  hots.forEach((c) => lines.push(`\u{1F525} מחשב ${c.number}: מעבד ${c.stats.cpuPct}% כבר 10 דקות`));
+  if (lines.length && alertsConfigured()) await sendAlert('SIONYX\n' + lines.join('\n'));
+}
+const monitorTimer = setInterval(() => { monitorTick().catch((e) => console.error('[dash] monitor:', e.message)); }, 15000);
+monitorTimer.unref();
+
+router.get('/events', requireAuth, (req, res) => {
+  const n = Math.max(1, Math.min(300, parseInt(req.query.limit, 10) || 100));
+  res.json({ events: events.slice(-n).reverse(), alerts: { configured: alertsConfigured(), telegram: !!(TG_TOKEN && TG_CHAT), webhook: !!ALERT_WEBHOOK, durable: kvOn() } });
+});
+router.get('/computers/:number/history', requireAuth, (req, res) => {
+  res.json({ step: HIST_STEP_MS, samples: hist.get(req.params.number) || [] });
+});
+router.get('/computers/:number/log', requireAuth, (req, res) => {
+  const c = computers.get(req.params.number);
+  if (!c) return res.status(404).json({ error: 'unknown computer' });
+  res.json({ text: c.logTail || '', at: c.logAt || null });
+});
+router.post('/alerts/test', requireAuth, async (_req, res) => {
+  if (!alertsConfigured()) return res.status(409).json({ error: 'not_configured' });
+  const ok = await sendAlert('SIONYX: הודעת בדיקה - ההתראות עובדות \u2705');
+  res.status(ok ? 200 : 502).json({ ok });
 });
 
 module.exports = function mount(app) {

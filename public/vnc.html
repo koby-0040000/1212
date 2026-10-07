@@ -46,8 +46,8 @@
     <option value="clip">דרך הלוח + Ctrl+V</option>
     <option value="type">כהקלדה</option>
   </select>
-  <input id="pasteBox" placeholder="גיבוי: הדבק כאן" title="אם הדפדפן חוסם גישה ללוח: לחץ Ctrl+V בתיבה הזו והטקסט יישלח אוטומטית." />
-  <button id="btnSendPaste" title="שלח את הטקסט שבתיבה למחשב המרוחק">שלח</button>
+  <input id="pasteBox" style="display:none" placeholder="גיבוי: הדבק כאן" title="אם הדפדפן חוסם גישה ללוח: לחץ Ctrl+V בתיבה הזו והטקסט יישלח אוטומטית." />
+  <button id="btnSendPaste" style="display:none" title="שלח את הטקסט שבתיבה למחשב המרוחק">שלח</button>
   <button id="btnCopyRemote" title="העתק את מה שהועתק במחשב המרוחק" disabled>העתק ממחשב מרוחק</button>
   <div class="sep"></div>
   <span style="color:#aaa; font-size:12px;">מהירות:</span>
@@ -359,7 +359,7 @@
       try { text = await navigator.clipboard.readText(); }
       catch (e) {
         notice('הדפדפן חסם גישה ללוח. אשר גישה בסמל שליד הכתובת, או הדבק (Ctrl+V) בתיבה "גיבוי" בסרגל.', 6000);
-        pasteBox.focus(); return;
+        pasteBox.style.display = ''; document.getElementById('btnSendPaste').style.display = ''; pasteBox.focus(); return;
       }
       await smartPaste(text, force);
     }

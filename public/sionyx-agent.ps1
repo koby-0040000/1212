@@ -112,6 +112,12 @@ function Run-Command([string]$cmd) {
       'uninstall' { Start-Uninstall }
       'sysinfo'  { Start-SysInfoJob }
       'nettest'  { Start-NetTestJob }
+      'getlog'   { try { $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction Stop) -join "`n") } catch { $script:LogTail = '(no log yet)' } }
+      'restartfilter' {
+        # Fixed, built-in sequence (not remote code): restart the content-filter services. Runs in the background (~20s).
+        $code = '$o = @(); try { Stop-Service WiFree3 -Force -ErrorAction Stop; $o += ''WiFree3 stopped'' } catch { $o += ''WiFree3 stop: '' + $_.Exception.Message }; Start-Sleep -Seconds 2; $o += (sc.exe continue ContentBlockerAgent | Out-String).Trim(); Start-Sleep -Seconds 15; $o += (sc.exe query ContentBlockerAgent | Out-String).Trim(); try { Start-Service WiFree3 -ErrorAction Stop; $o += ''WiFree3 started'' } catch { $o += ''WiFree3 start: '' + $_.Exception.Message }; ($o -join '' | '')'
+        Start-BgJob 'restartfilter' $code
+      }
       default    { Log "unknown command ignored: $cmd" }
     }
   } catch { Log "command failed: $($_.Exception.Message)" }
@@ -367,7 +373,7 @@ function Poll-BgJobs {
       try { $val = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -Last 1 } catch { Log "background job $name failed: $($_.Exception.Message)" }
       try { $j.Ps.Dispose() } catch { }
       $script:BgJobs.Remove($name)
-      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } }
+      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
     } elseif (((Get-Date) - $j.At).TotalSeconds -gt 100) {
       Log "background job $name timed out after 100s - abandoned (the heartbeat keeps running)"
       try { [void]$j.Ps.BeginStop($null, $null) } catch { }
@@ -409,6 +415,7 @@ function Beat([bool]$busy) {
     if ($script:SysInfo) { $b.sysinfo = $script:SysInfo; $script:SysInfo = $null }
     if ($script:KillResult) { $b.killResult = $script:KillResult; $script:KillResult = $null }
     if ($script:NetInfo) { $b.netinfo = $script:NetInfo; $script:NetInfo = $null }
+    if ($script:LogTail) { $b.logTail = $script:LogTail; $script:LogTail = $null }
     if ($script:LastRtt -ne $null) { $b.rttMs = $script:LastRtt }   # round-trip of the PREVIOUS heartbeat
     $body = $b | ConvertTo-Json -Compress -Depth 4
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -591,6 +598,15 @@ function Check-ForUpdate {
   } catch { Log "update check failed: $($_.Exception.Message)" }
 }
 
+# After a network outage, a pooled connection or a cached DNS answer can be dead: refresh them regularly
+# so the agent reconnects by itself within seconds of the network coming back.
+try {
+  $sp = [Net.ServicePointManager]
+  $sp::DnsRefreshTimeout = 30000
+  $sp::DefaultConnectionLimit = 8
+  $sp::FindServicePoint([Uri]$Server).ConnectionLeaseTimeout = 30000
+  $sp::FindServicePoint([Uri]$Server).MaxIdleTime = 30000
+} catch { }
 Log "agent started: computer $ComputerNumber -> $Server"
 Ensure-Watchdog
 while ($true) {
