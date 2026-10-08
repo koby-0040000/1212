@@ -332,7 +332,7 @@ function paint(entry, c) {
     if (c.diagAt && c.diagCount != null && Date.now() - c.diagAt < 6 * 3600e3) tag(c.diagCount ? '\u{1FA7A} ' + c.diagCount + ' בעיות' : '\u{1FA7A} תקין', c.diagCount ? 'warn' : 'ok');
     if (!c.upToDate) tag('\u2B06 ממתין לעדכון סוכן', 'warn');
   }
-  r.go.disabled = !c.online || c.uninstalling;
+  r.go.disabled = !(c.online || c.connState === 'unstable') || c.uninstalling;
   r.cmd.disabled = c.uninstalling;
   r.sys.disabled = !c.online || c.uninstalling;
   r.rep.disabled = !c.online || c.uninstalling;
@@ -639,7 +639,7 @@ async function connect(c, btn) {
     if (w) w.location = r.url; else location.href = r.url;
   } catch (e) {
     if (w) w.close();
-    toast(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message, 'err');
+    toast(e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err');
   }
   setTimeout(() => { btn.textContent = 'התחבר'; refresh(); }, 3000);
 }
@@ -658,7 +658,7 @@ async function sendCommand(c, action) {
     refresh();
   } catch (e) {
     if (e.status === 409 && /agent_outdated/.test(e.message || '')) toast(action === 'uninstall' ? `במחשב ${c.number} רץ סוכן ישן שלא מכיר את פקודת ההסרה. יש להריץ עליו את המתקין מחדש פעם אחת, ואז אפשר להסיר מרחוק.` : OUTDATED_MSG, 'err');
-    else toast(e.status === 409 ? 'המחשב כבוי' : 'שגיאה: ' + e.message, 'err');
+    else toast(e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err');
   }
 }
 

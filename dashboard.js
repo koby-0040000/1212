@@ -245,7 +245,8 @@ router.get('/computers', requireAuth, (_req, res) => {
 router.post('/computers/:number/connect', requireAuth, (req, res) => {
   const c = computers.get(req.params.number);
   if (!c) return res.status(404).json({ error: 'unknown computer' });
-  if (!isOnline(c)) return res.status(409).json({ error: 'offline' });
+  // allow connecting while 'unstable' (reconnecting): the agent may be alive but slow to heartbeat
+  if (!isOnline(c) && connState(c) === 'offline') return res.status(409).json({ error: 'offline' });
   const token = crypto.randomBytes(16).toString('hex'); // one-time room key
   c.pending = { token, createdAt: Date.now() };
   const url = `/vnc.html?token=${token}` + (VNC_PASSWORD ? `&password=${encodeURIComponent(VNC_PASSWORD)}` : '');
