@@ -371,11 +371,35 @@ function render() {
   });
 }
 
+// The server forgets its list on every deploy/restart (Render free has no disk). This browser remembers
+// computers it has seen, so one that is off or unreachable stays in the list as "not connected".
+const KNOWN_KEY = 'sx_known_computers';
+function loadKnown() { try { return JSON.parse(localStorage.getItem(KNOWN_KEY)) || {}; } catch (_) { return {}; } }
+function saveKnown(k) { try { localStorage.setItem(KNOWN_KEY, JSON.stringify(k)); } catch (_) { } }
+function mergeKnown(list) {
+  const known = loadKnown();
+  const seen = new Set();
+  for (const c of list) {
+    seen.add(c.number);
+    known[c.number] = { number: c.number, name: c.name || '', hostname: c.hostname || '', lastSeen: c.lastSeen || (known[c.number] && known[c.number].lastSeen) || null };
+  }
+  saveKnown(known);
+  const out = list.slice();
+  for (const k of Object.values(known)) {
+    if (seen.has(k.number)) continue;
+    out.push({ number: k.number, name: k.name || '', hostname: k.hostname || '', online: false, connState: 'offline', busy: false,
+      uninstalling: false, uninstallFailed: false, lastSeen: k.lastSeen || null, firstSeen: null, stats: null, sysinfo: null,
+      rttMs: null, netinfo: null, upToDate: true, ghost: true });
+  }
+  return out;
+}
+function dropKnown(number) { const k = loadKnown(); delete k[number]; saveKnown(k); }
+
 async function refresh() {
   try {
     const r = await api('/computers');
-    data = r.computers; window.curAgentVer = r.agentVer || ''; $('curVer').textContent = window.curAgentVer || '?';
-    $('sOnline').textContent = r.online; $('sTotal').textContent = r.total; $('sUnst').textContent = r.unstable || 0; $('sOff').textContent = r.total - r.online - (r.unstable || 0);
+    data = mergeKnown(r.computers); window.curAgentVer = r.agentVer || ''; $('curVer').textContent = window.curAgentVer || '?';
+    $('sOnline').textContent = r.online; $('sTotal').textContent = data.length; $('sUnst').textContent = r.unstable || 0; $('sOff').textContent = data.length - r.online - (r.unstable || 0);
     render(); updateBulk();
     checkSysInfoWatch();
     checkKillWatch();
@@ -666,13 +690,15 @@ async function sendCommand(c, action) {
 async function rename(c) {
   const name = prompt('שם למחשב ' + c.number, c.name || '');
   if (name === null) return;
+  if (c.ghost) { const k = loadKnown(); if (k[c.number]) { k[c.number].name = name.slice(0, 60); saveKnown(k); } refresh(); return; }
   await api(`/computers/${encodeURIComponent(c.number)}/name`, { method: 'POST', body: { name } });
   refresh();
 }
 
 async function forget(c) {
-  if (!confirm(`להסיר את מחשב ${c.number} מהרשימה? הוא יופיע שוב כשיידלק.`)) return;
-  await api(`/computers/${encodeURIComponent(c.number)}`, { method: 'DELETE' });
+  if (!confirm(`להסיר את מחשב ${c.number} מהרשימה? הוא יופיע שוב כשיתחבר.`)) return;
+  if (!c.ghost) { try { await api(`/computers/${encodeURIComponent(c.number)}`, { method: 'DELETE' }); } catch (e) { if (e.status !== 404) throw e; } }
+  dropKnown(c.number);
   refresh();
 }
 
