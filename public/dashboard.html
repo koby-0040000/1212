@@ -173,7 +173,7 @@
       <div class="logo">&#128421;</div>
       <div>
         <h1>מחשבים מרוחקים</h1>
-        <div class="live"><i></i> מתעדכן אוטומטית · גרסה עדכנית: <b id="curVer">...</b></div>
+        <div class="live"><i></i> מתעדכן אוטומטית · גרסה עדכנית: <b id="curVer" title="">...</b></div>
       </div>
     </div>
     <div class="chips">
@@ -185,7 +185,7 @@
     <div class="tools">
       <input id="q" type="text" placeholder="&#128269; חיפוש מספר / שם">
       <button id="evBtn" type="button" title="אירועים, התראות והגדרות">&#128276; אירועים</button>
-      <a href="/api/installer" download><button class="primary" type="button">&#11015; הורד מתקין</button></a>
+      <a href="/api/installer" download><button class="primary" id="instBtn" type="button">&#11015; הורד מתקין</button></a>
       <button id="logout">יציאה</button>
     </div>
   </header>
@@ -330,7 +330,7 @@ function paint(entry, c) {
     if (c.rttMs != null) tag('\u{1F4F6} ' + c.rttMs + ' ms', c.rttMs < 300 ? '' : 'warn');
     tag(st.vnc ? '\u2714 VNC מוכן' : '\u26A0 VNC לא זמין', st.vnc ? 'ok' : 'warn');
     if (c.diagAt && c.diagCount != null && Date.now() - c.diagAt < 6 * 3600e3) tag(c.diagCount ? '\u{1FA7A} ' + c.diagCount + ' בעיות' : '\u{1FA7A} תקין', c.diagCount ? 'warn' : 'ok');
-    tag('\u{1F3F7} גרסה ' + (st.ver || '?'), c.upToDate ? 'ok' : 'warn');
+    const vt = tag('\u{1F3F7} גרסה ' + (c.verLabel || st.ver || '?'), c.upToDate ? 'ok' : 'warn'); vt.title = 'מזהה: ' + (st.ver || '?');
     if (!c.upToDate) tag('\u2B06 ממתין לעדכון סוכן', 'warn');
   }
   r.go.disabled = !(c.online || c.connState === 'unstable') || c.uninstalling;
@@ -398,7 +398,7 @@ function dropKnown(number) { const k = loadKnown(); delete k[number]; saveKnown(
 async function refresh() {
   try {
     const r = await api('/computers');
-    data = mergeKnown(r.computers); window.curAgentVer = r.agentVer || ''; $('curVer').textContent = window.curAgentVer || '?';
+    data = mergeKnown(r.computers); window.curAgentVer = r.agentVer || ''; $('curVer').textContent = r.agentLabel || window.curAgentVer || '?'; $('curVer').title = 'מזהה: ' + window.curAgentVer; $('instBtn').textContent = '\u2B07 הורד מתקין' + (r.agentLabel ? ' v' + r.agentLabel : '');
     $('sOnline').textContent = r.online; $('sTotal').textContent = data.length; $('sUnst').textContent = r.unstable || 0; $('sOff').textContent = data.length - r.online - (r.unstable || 0);
     render(); updateBulk();
     checkSysInfoWatch();

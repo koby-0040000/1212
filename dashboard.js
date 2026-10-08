@@ -43,6 +43,12 @@ function agentFingerprint() {
   } catch (_) { return ''; }
 }
 const AGENT_VER = agentFingerprint();
+// Human-readable version numbers live in versions.json (fingerprint -> label). The last entry is the newest.
+let VERSION_LIST = [];
+try { VERSION_LIST = JSON.parse(fs.readFileSync(path.join(__dirname, 'versions.json'), 'utf8')).versions || []; } catch (_) { /* no file: fall back to the fingerprint */ }
+const labelFor = (fp) => { const v = VERSION_LIST.find((x) => x.fp === fp); return v ? String(v.label) : (fp || ''); };
+const AGENT_LABEL = labelFor(AGENT_VER);
+console.log(`[dash] agent version ${AGENT_LABEL} (fingerprint ${AGENT_VER})`);
 const UNINSTALL_ALIVE_MS = 20 * 1000;
 const UNINSTALL_WAIT_MS = 2 * 60 * 1000; // how long the dashboard shows "removing..." before giving up
 const COMMAND_TTL_MS = 60 * 1000; // a queued command the agent does not pick up in time is dropped
@@ -200,6 +206,7 @@ const view = (c) => ({
   killResult: c.killResult || null, killResultAt: c.killResultAt || null,
   rttMs: c.rttMs != null ? c.rttMs : null, netinfo: c.netinfo || null, netinfoAt: c.netinfoAt || null,
   upToDate: !!(AGENT_VER && c.stats && c.stats.ver === AGENT_VER),
+  verLabel: c.stats && c.stats.ver ? labelFor(c.stats.ver) : '',
 });
 
 // ---- routes ----
@@ -236,6 +243,7 @@ router.get('/computers', requireAuth, (_req, res) => {
   res.json({
     serverTime: Date.now(),
     agentVer: AGENT_VER,
+    agentLabel: AGENT_LABEL,
     total: list.length,
     online: list.filter((c) => c.online).length,
     unstable: list.filter((c) => c.connState === 'unstable').length,
@@ -354,7 +362,8 @@ router.get('/installer', requireAuth, (req, res) => {
   if (!AGENT_KEY) return res.status(503).json({ error: 'AGENT_KEY is not set on the server' });
   const server = process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
   res.set('Content-Type', 'application/octet-stream');
-  res.set('Content-Disposition', 'attachment; filename="sionyx-install.cmd"');
+  const verName = String(AGENT_LABEL).replace(/[^0-9A-Za-z._-]/g, '');
+  res.set('Content-Disposition', `attachment; filename="sionyx-install${verName ? '-v' + verName : ''}.cmd"`);
   res.send(buildInstaller({ server: server.replace(/\/$/, ''), key: AGENT_KEY, vncPassword: VNC_PASSWORD }));
 });
 
