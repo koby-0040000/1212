@@ -384,6 +384,11 @@ router.post('/agent/heartbeat', (req, res) => {
   if (typeof body.rttMs === 'number' && body.rttMs >= 0 && body.rttMs < 60000) { c.rttMs = Math.round(body.rttMs); c.rttAt = now; }
   const ni = cleanNetInfo(body.netinfo);
   if (ni) { c.netinfo = ni; c.netinfoAt = now; }
+  if (typeof body.updateNote === 'string' && body.updateNote) {
+    const note = body.updateNote.slice(0, 200);
+    addEvent(c.number, 'down', 'עדכון סוכן: ' + note + ' (הגרסה הקודמת נשארה פעילה)');
+    if (alertsConfigured()) sendAlert(`SIONYX\n\u26A0\uFE0F מחשב ${c.number}: עדכון הסוכן נדחה/בוטל ונשארה הגרסה הקודמת.\n${note}`).catch(() => {});
+  }
   const og = body.outage;
   if (og && typeof og === 'object' && Number(og.secs) >= 20) {
     const CAUSE = { dns: 'שרת השמות (DNS) לא ענה', timeout: 'פסק זמן - אין תגובה מהשרת', no_route: 'אין נתיב לרשת או לשרת', tls: 'שגיאת הצפנה/תעודה (בדוק שעון המחשב וסינון)', proxy: 'בעיית פרוקסי', server: 'השרת עצמו לא היה זמין (עדכון/הפעלה מחדש)', auth: 'שגיאת הרשאה', other: 'סיבה לא ידועה' };

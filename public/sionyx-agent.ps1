@@ -780,6 +780,8 @@ function Beat([bool]$busy) {
     if ($script:FixResults.Count -gt 0) { $b.fixResults = @($script:FixResults); $script:FixResults = @() }
     if ($script:LogTail) { $b.logTail = $script:LogTail; $script:LogTail = $null }
     if ($script:LastRtt -ne $null) { $b.rttMs = $script:LastRtt }   # round-trip of the PREVIOUS heartbeat
+    $sentNote = $script:UpdateNote
+    if ($sentNote) { $b.updateNote = $sentNote }
     $sentOutage = $script:Outage
     if ($sentOutage) { $b.outage = $sentOutage }
     $body = $b | ConvertTo-Json -Compress -Depth 8
@@ -787,6 +789,7 @@ function Beat([bool]$busy) {
     $resp = Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
     $script:LastRtt = [int]$sw.ElapsedMilliseconds
     if ($sentOutage) { $script:Outage = $null }
+    if ($sentNote -and $script:UpdateNote -eq $sentNote) { $script:UpdateNote = '' }
     Note-Success
     return $resp
   } catch { Note-Failure $_; return $null }
@@ -952,17 +955,115 @@ function Run-Session([string]$Token) {
 # process already used for server.js - no more visiting every kiosk by hand.
 $script:AgentFile = Join-Path $Dir 'agent.ps1'
 $script:LastUpdateCheck = Get-Date
+# ---- safe self-update ----
+# A bad agent version must never leave computers stranded outside the network. Protections:
+#  1. A new version is only installed if it passes a real PowerShell parse check (and basic sanity checks).
+#  2. The previous version is kept (agent.prev.ps1). If the new version crashes 3 times before it ever managed to
+#     talk to the server, the agent rolls back to the previous version by itself and reports it.
+#  3. A version that ran fine and stayed connected for 90s is saved as "last known good" (agent.good.ps1).
+#  4. The launcher (run-agent2.cmd) restores agent.good.ps1 if agent.ps1 cannot even be parsed at startup.
+$script:PrevFile = Join-Path $Dir 'agent.prev.ps1'
+$script:GoodFile = Join-Path $Dir 'agent.good.ps1'
+$script:PendingFile = Join-Path $Dir 'update.pending'
+$script:NoteFile = Join-Path $Dir 'update.note'
+$script:StartedAt = Get-Date
+$script:UpdateNote = ''
+$script:RejectedFp = ''
+
+function Get-TextFp([string]$t) {
+  $n = ([string]$t).TrimStart([char]0xFEFF).Replace("`r", '')
+  $sha = [Security.Cryptography.SHA1]::Create()
+  return (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($n)) | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+}
+# Returns '' when the text looks like a healthy agent script, otherwise the reason it was refused.
+function Test-AgentText($t) {
+  if ($t -isnot [string]) { return 'download is not text' }
+  if ($t.Length -lt 20000) { return 'download is too short' }
+  if ($t -notmatch 'agent started:' -or $t -notmatch 'function Beat') { return 'expected agent code is missing' }
+  $tok = $null; $err = $null
+  [void][System.Management.Automation.Language.Parser]::ParseInput($t, [ref]$tok, [ref]$err)
+  if ($err -and $err.Count -gt 0) { return ('parse error at line ' + $err[0].Extent.StartLineNumber + ': ' + $err[0].Message) }
+  return ''
+}
+function Set-UpdateNote([string]$text) {
+  if ($text.Length -gt 200) { $text = $text.Substring(0, 200) }
+  $script:UpdateNote = ($text -replace '[^\x20-\x7E]', '?')
+}
 function Check-ForUpdate {
   try {
     $latest = Invoke-RestMethod -Method Get -Uri "$Server/sionyx-agent.ps1" -UseBasicParsing -TimeoutSec 20
     $current = ''
     if (Test-Path $script:AgentFile) { $current = [IO.File]::ReadAllText($script:AgentFile) }
-    if ($latest -and $latest -ne $current) {
-      Log 'new agent version found on the server - updating and restarting'
-      [IO.File]::WriteAllText($script:AgentFile, $latest)
-      exit 1   # non-zero = the scheduled task's restart policy relaunches us in ~1 min (the watchdog trigger is the backup)
+    if ($latest -is [string] -and (Get-TextFp $latest) -eq (Get-TextFp $current)) { return }   # same version (ignores line endings / BOM)
+    $why = Test-AgentText $latest
+    if ($why) {
+      $fp = if ($latest -is [string]) { Get-TextFp $latest } else { 'x' }
+      if ($fp -ne $script:RejectedFp) { $script:RejectedFp = $fp; Log ('update REJECTED (kept the current version): ' + $why); Set-UpdateNote ('update rejected: ' + $why) }
+      return
     }
+    Log 'new agent version found on the server - updating and restarting'
+    if ($current) { [IO.File]::WriteAllText($script:PrevFile, $current) }
+    [IO.File]::WriteAllText($script:AgentFile, $latest)
+    [IO.File]::WriteAllText($script:PendingFile, 'starts=0')
+    exit 1   # non-zero = the scheduled task's restart policy relaunches us in ~1 min (the watchdog trigger is the backup)
   } catch { Log "update check failed: $($_.Exception.Message)" }
+}
+# Called once at startup: counts crashes of a freshly installed version and rolls back a crash-looping one.
+function Check-PendingUpdate {
+  try {
+    if (Test-Path $script:NoteFile) { Set-UpdateNote ([IO.File]::ReadAllText($script:NoteFile)); Remove-Item $script:NoteFile -Force -ErrorAction SilentlyContinue }
+    if (-not (Test-Path $script:PendingFile)) { return }
+    $n = 0
+    try { $n = [int](([IO.File]::ReadAllText($script:PendingFile)) -replace '[^0-9]', '') } catch { }
+    $n++
+    if ($n -ge 4 -and (Test-Path $script:PrevFile)) {
+      Log ('new version crashed ' + ($n - 1) + ' times before connecting - ROLLING BACK to the previous version')
+      Copy-Item -LiteralPath $script:PrevFile -Destination $script:AgentFile -Force
+      Remove-Item $script:PendingFile -Force -ErrorAction SilentlyContinue
+      [IO.File]::WriteAllText($script:NoteFile, 'new agent version crashed repeatedly - rolled back to the previous version')
+      exit 1
+    }
+    [IO.File]::WriteAllText($script:PendingFile, ('starts=' + $n))
+  } catch { Log "pending-update check failed: $($_.Exception.Message)" }
+}
+# A version that has been running and connected for 90s is "good": remember it as the rollback / launcher fallback target.
+function Confirm-GoodVersion {
+  try {
+    if ($script:Fail.Since -or $script:LastRtt -eq $null) { return }
+    if (((Get-Date) - $script:StartedAt).TotalSeconds -lt 90) { return }
+    if (-not (Test-Path $script:PendingFile) -and (Test-Path $script:GoodFile)) { return }
+    Copy-Item -LiteralPath $script:AgentFile -Destination $script:GoodFile -Force
+    if (Test-Path $script:PendingFile) { Remove-Item $script:PendingFile -Force; Log 'new version confirmed good' }
+  } catch { }
+}
+# Upgrades the launcher once: if agent.ps1 ever fails to parse at startup, restore the last known good copy
+# instead of crash-looping forever. Written as a NEW file and pointed to from the scheduled task (a running .cmd
+# must not be overwritten while it is executing).
+function Ensure-Launcher {
+  try {
+    $l2 = Join-Path $Dir 'run-agent2.cmd'
+    $tpl = @'
+$d = Join-Path $env:ProgramData 'SionyxAgent'
+$f = Join-Path $d 'agent.ps1'
+function Load-Agent { [scriptblock]::Create([IO.File]::ReadAllText($f)) }
+try { $sb = Load-Agent } catch {
+  Add-Content (Join-Path $d 'agent.log') ((Get-Date -Format s) + ' launcher: agent.ps1 does not parse - restoring last known good')
+  $g = Join-Path $d 'agent.good.ps1'
+  if (Test-Path $g) { Copy-Item $g $f -Force; $sb = Load-Agent } else { throw }
+}
+& $sb -ComputerNumber '__N__' -Key '__K__' -Server '__S__'
+'@
+    $boot = $tpl.Replace('__N__', $ComputerNumber.Replace("'", "''")).Replace('__K__', $Key.Replace("'", "''")).Replace('__S__', $Server.Replace("'", "''"))
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($boot))
+    $line = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ' + $b64
+    $wantArg = '/c "' + $l2 + '"'
+    $t = Get-ScheduledTask -TaskName 'SionyxAgent' -ErrorAction Stop
+    $haveArg = [string](@($t.Actions)[0]).Arguments
+    if ($haveArg -eq $wantArg -and (Test-Path $l2)) { return }
+    [IO.File]::WriteAllText($l2, ("@echo off`r`n" + $line + "`r`n"), [Text.Encoding]::ASCII)
+    Set-ScheduledTask -TaskName 'SionyxAgent' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $wantArg) | Out-Null
+    Log 'launcher upgraded (falls back to the last known good agent if the script cannot start)'
+  } catch { Log "launcher upgrade skipped: $($_.Exception.Message)" }
 }
 
 # After a network outage, a pooled connection or a cached DNS answer can be dead: refresh them regularly
@@ -975,13 +1076,16 @@ try {
   $sp::FindServicePoint([Uri]$Server).MaxIdleTime = 30000
 } catch { }
 Log "agent started: computer $ComputerNumber -> $Server"
+Check-PendingUpdate
 Ensure-Watchdog
+Ensure-Launcher
 while ($true) {
   Poll-BgJobs
   Start-NextFix
   Refresh-Stats
   $r = Beat $false
   Step-NetHeal
+  Confirm-GoodVersion
   Handle-Reply $r
   if ($r -and $r.session) { Run-Session ([string]$r.session) }
   if (((Get-Date) - $script:LastUpdateCheck).TotalMinutes -ge 10) {
