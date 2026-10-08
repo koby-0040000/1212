@@ -375,7 +375,7 @@ function Poll-BgJobs {
       try { $val = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -Last 1 } catch { Log "background job $name failed: $($_.Exception.Message)" }
       try { $j.Ps.Dispose() } catch { }
       $script:BgJobs.Remove($name)
-      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'diag') { $script:DiagResult = $val } elseif ($name -eq 'fix') { $script:FixResults += $val; Log ("fix result: " + $val.id + ' ok=' + $val.ok + ' ' + $val.msg) } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
+      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'heal') { $script:Fail.Heals += [string]$val.text; $script:Fail.Local = $val.local; Log ('network self-heal result: ' + $val.text) } elseif ($name -eq 'diag') { $script:DiagResult = $val } elseif ($name -eq 'fix') { $script:FixResults += $val; Log ("fix result: " + $val.id + ' ok=' + $val.ok + ' ' + $val.msg) } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
     } elseif (((Get-Date) - $j.At).TotalSeconds -gt $(if ($name -eq 'fix') { 300 } else { 100 })) {
       Log "background job $name timed out - abandoned (the heartbeat keeps running)"
       try { [void]$j.Ps.BeginStop($null, $null) } catch { }
@@ -511,6 +511,43 @@ function Get-Diagnosis {
     if ($best -and $best.pct -ge 30) { [void]$f.Add(@{ id = 'cpu_hog'; sev = 'warn'; fix = ''; p = $best }) }
   } catch { }
 
+  # 12. network configuration problems
+  try {
+    $checks++
+    $phys = @(Get-NetAdapter -Physical -ErrorAction Stop)
+    $up = @($phys | Where-Object { $_.Status -eq 'Up' })
+    if ($up.Count -eq 0) {
+      if (@($phys | Where-Object { $_.Status -eq 'Disabled' }).Count -gt 0) { [void]$f.Add(@{ id = 'adapter_disabled'; sev = 'bad'; fix = 'enable_adapter'; p = @{ x = 1 } }) }
+      else { [void]$f.Add(@{ id = 'adapter_down'; sev = 'bad'; fix = ''; p = @{ x = 1 } }) }
+    } else {
+      $ipc = Get-NetIPAddress -InterfaceIndex $up[0].ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+      if (-not $ipc -or ([string]$ipc.IPAddress).StartsWith('169.254')) {
+        [void]$f.Add(@{ id = 'apipa'; sev = 'bad'; fix = 'renew_ip'; p = @{ ip = [string]$ipc.IPAddress } })
+      } else {
+        $g = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+        if ($g -and $g -ne '0.0.0.0') {
+          if (((Ping-Ms $g) -lt 0) -and ((Ping-Ms $g) -lt 0)) { [void]$f.Add(@{ id = 'gw_unreachable'; sev = 'bad'; fix = 'restart_adapter'; p = @{ gw = [string]$g } }) }
+        } else { [void]$f.Add(@{ id = 'no_gateway'; sev = 'bad'; fix = 'renew_ip'; p = @{ x = 1 } }) }
+      }
+    }
+  } catch { }
+  # 13. system proxy (WinHTTP) and hosts-file override of our server name
+  try {
+    $checks++
+    $o = (netsh winhttp show proxy | Out-String)
+    if ($o -notmatch 'Direct access') {
+      $line = (($o -split "`n" | Where-Object { $_ -match 'Proxy Server' } | Select-Object -First 1) -replace '[^\x20-\x7E]', '').Trim()
+      if ($line.Length -gt 100) { $line = $line.Substring(0, 100) }
+      [void]$f.Add(@{ id = 'proxy_set'; sev = 'warn'; fix = ''; p = @{ line = $line } })
+    }
+  } catch { }
+  try {
+    $checks++
+    $hn = ([Uri]$Server).Host
+    $hosts = Get-Content -Path "$env:windir\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '^\s*#' -and $_ -match [regex]::Escape($hn) }
+    if ($hosts) { [void]$f.Add(@{ id = 'hosts_override'; sev = 'bad'; fix = ''; p = @{ host = $hn } }) }
+  } catch { }
+
   return @{ findings = @($f); checks = $checks; took = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) }
 }
 
@@ -560,6 +597,28 @@ function Invoke-Fix([string]$id) {
         powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e | Out-Null
         $res.ok = ($LASTEXITCODE -eq 0); $res.msg = 'power plan set to Balanced'
       }
+      'renew_ip' {
+        ipconfig /release | Out-Null; Start-Sleep -Seconds 2
+        ipconfig /renew | Out-Null
+        $res.ok = ($LASTEXITCODE -eq 0); $res.msg = 'DHCP lease released and renewed'
+      }
+      'restart_adapter' {
+        $a = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+        if ($a) { Restart-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop; Start-Sleep -Seconds 8; $res.ok = $true; $res.msg = 'restarted adapter ' + $a.Name }
+        else { $res.msg = 'no active adapter' }
+      }
+      'enable_adapter' {
+        $n = 0
+        foreach ($d in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Disabled' })) { Enable-NetAdapter -Name $d.Name -Confirm:$false -ErrorAction SilentlyContinue; $n++ }
+        Start-Sleep -Seconds 6
+        $res.ok = ($n -gt 0); $res.msg = 'enabled ' + $n + ' adapter(s)'
+      }
+      'reset_network_stack' {
+        netsh winsock reset | Out-Null
+        netsh int ip reset | Out-Null
+        ipconfig /flushdns | Out-Null
+        $res.ok = $true; $res.msg = 'winsock and TCP/IP reset - restart the computer to finish'
+      }
       default { $res.msg = 'unknown fix' }
     }
   } catch { $res.msg = 'error: ' + $_.Exception.Message }
@@ -569,11 +628,11 @@ function Invoke-Fix([string]$id) {
 $script:FixQueue = New-Object 'System.Collections.Generic.Queue[string]'
 $script:DiagResult = $null
 $script:FixResults = @()
-$script:FixIds = @('clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced')
+$script:FixIds = @('clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack')
 function Start-DiagJob {
   $k = $Key.Replace("'", "''"); $sv = $Server.Replace("'", "''")
   $prefix = "`$Server = '$sv'; `$Key = '$k'; `$Headers = @{ 'x-agent-key' = `$Key }"
-  Start-BgJob 'diag' (Build-JobScript @('Get-TempDirs', 'Get-TempBytes', 'Get-Diagnosis') $prefix 'Get-Diagnosis')
+  Start-BgJob 'diag' (Build-JobScript @('Ping-Ms', 'Get-TempDirs', 'Get-TempBytes', 'Get-Diagnosis') $prefix 'Get-Diagnosis')
 }
 function Start-NextFix {
   if ($script:BgJobs.ContainsKey('fix') -or $script:FixQueue.Count -eq 0) { return }
@@ -581,6 +640,107 @@ function Start-NextFix {
   if ($script:FixIds -notcontains $id) { Log "fix refused (not in whitelist): $id"; return }
   Log "running fix: $id"
   Start-BgJob 'fix' (Build-JobScript @('Get-TempDirs', 'Get-TempBytes', 'Invoke-Fix') '' "Invoke-Fix '$id'")
+}
+
+# ---- network self-heal ----
+# A computer with a network problem cannot be repaired from the dashboard while it is disconnected, so the agent
+# repairs the LOCAL network itself, step by step, based on how long the outage lasts and what is actually broken.
+# It never touches proxy settings (a filter may legitimately need them) and never reboots the computer.
+function Test-LocalNet {
+  $r = @{ adapter = $false; ip = ''; apipa = $false; gw = $false; inet = $false; dns = $false }
+  try {
+    $a = Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+    if ($a) {
+      $r.adapter = $true
+      $ipc = Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($ipc) { $r.ip = [string]$ipc.IPAddress; $r.apipa = $r.ip.StartsWith('169.254') }
+    }
+  } catch { }
+  try {
+    $g = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+    if ($g -and $g -ne '0.0.0.0') { $r.gw = ((Ping-Ms $g) -ge 0) -or ((Ping-Ms $g) -ge 0) }
+  } catch { }
+  $r.inet = ((Test-TcpMs '1.1.1.1' 443) -ge 0) -or ((Test-TcpMs '8.8.8.8' 443) -ge 0)
+  try { [void][Net.Dns]::GetHostAddresses('www.google.com'); $r.dns = $true } catch { }
+  return $r
+}
+function Invoke-NetHeal([int]$level) {
+  $text = ''
+  try {
+    if ($level -eq 1) {
+      ipconfig /flushdns | Out-Null
+      try { Clear-DnsClientCache } catch { }
+      $text = 'L1 dns cache flushed'
+    } elseif ($level -eq 2) {
+      $loc = Test-LocalNet
+      if (-not $loc.adapter) {
+        $dis = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Disabled' })
+        if ($dis.Count -gt 0) { foreach ($d in $dis) { Enable-NetAdapter -Name $d.Name -Confirm:$false -ErrorAction SilentlyContinue }; $text = 'L2 enabled disabled adapter(s)' }
+        else { $text = 'L2 no active network adapter (cable unplugged / wifi off?) - nothing to repair' }
+      } elseif ($loc.apipa -or -not $loc.ip) {
+        ipconfig /release | Out-Null; Start-Sleep -Seconds 2; ipconfig /renew | Out-Null
+        $text = 'L2 no valid IP (' + $loc.ip + '): released and renewed DHCP lease'
+      } else {
+        $a = Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+        Restart-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop
+        $text = 'L2 gateway unreachable: restarted adapter ' + $a.Name
+      }
+    } else {
+      netsh winsock reset | Out-Null
+      netsh int ip reset | Out-Null
+      ipconfig /flushdns | Out-Null
+      $a = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+      if ($a) { Restart-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction SilentlyContinue }
+      $text = 'L3 winsock + TCP/IP stack reset (fully effective after the next reboot) and adapter restarted'
+    }
+  } catch { $text = ('L' + $level + ' failed: ' + $_.Exception.Message) }
+  if ($level -ge 2) { Start-Sleep -Seconds 15 }
+  $local = Test-LocalNet
+  return @{ level = $level; text = $text; local = $local }
+}
+
+$script:Fail = @{ Since = $null; Count = 0; Cause = ''; Msg = ''; Level = 0; Heals = @(); Local = $null }
+$script:Outage = $null
+function Get-ErrCause([string]$m) {
+  if ($m -match 'could not be resolved|No such host|name resolution|nodename') { return 'dns' }
+  if ($m -match 'SSL|TLS|secure channel|trust relationship|certificate') { return 'tls' }
+  if ($m -match '407|[Pp]roxy') { return 'proxy' }
+  if ($m -match '\b5\d\d\b|Bad Gateway|Service Unavailable|Gateway Time') { return 'server' }
+  if ($m -match '\b40[13]\b') { return 'auth' }
+  if ($m -match 'timed out|timeout|Timeout') { return 'timeout' }
+  if ($m -match 'Unable to connect|actively refused|unreachable|No route|network is unreachable|connection was closed') { return 'no_route' }
+  return 'other'
+}
+function Note-Failure($ex) {
+  $m = ''
+  try { $m = [string]$ex.Exception.Message } catch { }
+  if (-not $script:Fail.Since) { $script:Fail.Since = Get-Date; $script:Fail.Level = 0; $script:Fail.Heals = @(); $script:Fail.Local = $null }
+  $script:Fail.Count++
+  $script:Fail.Cause = Get-ErrCause $m
+  $script:Fail.Msg = (($m -replace '[^\x20-\x7E]', '?')); if ($script:Fail.Msg.Length -gt 120) { $script:Fail.Msg = $script:Fail.Msg.Substring(0, 120) }
+  if ($script:Fail.Count -eq 1 -or ($script:Fail.Count % 12) -eq 0) { Log ('heartbeat failed #' + $script:Fail.Count + ' (' + $script:Fail.Cause + '): ' + $script:Fail.Msg) }
+}
+function Note-Success {
+  if (-not $script:Fail.Since) { return }
+  $secs = [int]((Get-Date) - $script:Fail.Since).TotalSeconds
+  if ($secs -ge 20) {
+    $script:Outage = @{ secs = $secs; cause = $script:Fail.Cause; msg = $script:Fail.Msg; heals = ($script:Fail.Heals -join ' | '); local = $script:Fail.Local }
+    Log ('connection restored after ' + $secs + 's (cause=' + $script:Fail.Cause + ') ' + ($script:Fail.Heals -join ' | '))
+  }
+  $script:Fail = @{ Since = $null; Count = 0; Cause = ''; Msg = ''; Level = 0; Heals = @(); Local = $null }
+}
+function Start-HealJob([int]$level) {
+  Log ('network self-heal level ' + $level + ' starting')
+  Start-BgJob 'heal' (Build-JobScript @('Test-TcpMs', 'Ping-Ms', 'Test-LocalNet', 'Invoke-NetHeal') '' ("Invoke-NetHeal " + $level))
+}
+function Step-NetHeal {
+  if (-not $script:Fail.Since -or $script:BgJobs.ContainsKey('heal')) { return }
+  $secs = ((Get-Date) - $script:Fail.Since).TotalSeconds
+  $lvl = $script:Fail.Level
+  $localBroken = ($script:Fail.Local -ne $null) -and (-not $script:Fail.Local.gw)   # only act when the LOCAL network is the problem
+  if ($lvl -lt 1 -and $secs -ge 120) { $script:Fail.Level = 1; Start-HealJob 1 }
+  elseif ($lvl -lt 2 -and $secs -ge 300 -and $localBroken) { $script:Fail.Level = 2; Start-HealJob 2 }
+  elseif ($lvl -lt 3 -and $secs -ge 900 -and $localBroken) { $script:Fail.Level = 3; Start-HealJob 3 }
 }
 
 # Makes sure the scheduled task also has a repeating "start if not running" trigger, so the agent
@@ -620,12 +780,16 @@ function Beat([bool]$busy) {
     if ($script:FixResults.Count -gt 0) { $b.fixResults = @($script:FixResults); $script:FixResults = @() }
     if ($script:LogTail) { $b.logTail = $script:LogTail; $script:LogTail = $null }
     if ($script:LastRtt -ne $null) { $b.rttMs = $script:LastRtt }   # round-trip of the PREVIOUS heartbeat
+    $sentOutage = $script:Outage
+    if ($sentOutage) { $b.outage = $sentOutage }
     $body = $b | ConvertTo-Json -Compress -Depth 8
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $resp = Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
     $script:LastRtt = [int]$sw.ElapsedMilliseconds
+    if ($sentOutage) { $script:Outage = $null }
+    Note-Success
     return $resp
-  } catch { return $null }
+  } catch { Note-Failure $_; return $null }
 }
 
 # Fire-and-forget heartbeat for use INSIDE an active VNC session: the normal
@@ -817,6 +981,7 @@ while ($true) {
   Start-NextFix
   Refresh-Stats
   $r = Beat $false
+  Step-NetHeal
   Handle-Reply $r
   if ($r -and $r.session) { Run-Session ([string]$r.session) }
   if (((Get-Date) - $script:LastUpdateCheck).TotalMinutes -ge 10) {

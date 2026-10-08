@@ -477,6 +477,11 @@ function renderNetBox(c) {
   let html = `<div class="netHead"><span>\u{1F310} רשת וחיבור</span><button id="netBtn" class="small" type="button" ${waiting ? 'disabled' : ''}>${waiting ? 'בודק... (עד כדקה)' : '\u{1F50D} בדוק רשת עכשיו'}</button></div>`;
   html += `<div class="netRows"><div><span>קשר עם השרת (חי):</span> <b class="${msCls(c.rttMs, 300, 1000)}">${c.rttMs != null ? c.rttMs + ' ms' : '-'}</b></div>`
         + `<div><span>נראה לאחרונה:</span> ${c.lastSeen ? ago(c.lastSeen) : '-'}</div></div>`;
+  const o = c.lastOutage;
+  if (o) {
+    const CAUSE_HE = { dns: 'DNS לא ענה', timeout: 'פסק זמן', no_route: 'אין נתיב לרשת/לשרת', tls: 'שגיאת הצפנה/תעודה', proxy: 'פרוקסי', server: 'השרת לא היה זמין', auth: 'הרשאה', other: 'לא ידועה' };
+    html += `<div class="sysInsight" style="margin-bottom:8px">\u{1F4E1} הפסקת התקשורת האחרונה: לפני ${ago(o.at)}, נמשכה כ-${Math.max(1, Math.round(o.secs / 60))} דקות. סיבה: ${esc(CAUSE_HE[o.cause] || o.cause)}.${o.local ? (!o.local.adapter ? ' כרטיס הרשת לא היה פעיל.' : !o.local.gw ? ' הנתב לא ענה.' : !o.local.inet ? ' הרשת המקומית תקינה אבל לא היה אינטרנט.' : '') : ''}${o.heals ? '<br><span class="sysSub2" style="direction:ltr;display:block;text-align:left">auto-heal: ' + esc(o.heals) + '</span>' : ''}</div>`;
+  }
   if (!n) {
     html += '<div class="sysLoading" style="padding:8px">עדיין לא בוצעה בדיקת רשת מלאה במחשב הזה. לחץ "בדוק רשת עכשיו".</div>';
   } else {
@@ -787,6 +792,13 @@ const DIAG = {
   svc_stopped: { t: (p) => `שירותים חשובים לא רצים: ${p.names}`, d: 'בלי השירותים האלה השליטה מרחוק או הסינון עלולים לא לעבוד. התיקון מפעיל אותם.' },
   time_skew: { t: (p) => `השעון במחשב לא מדויק: הפרש של ${fmtSkew(p.sec)} מול השרת`, d: 'שעון שגוי שובר חיבורים מוצפנים (HTTPS) והתחברויות. התיקון מסנכרן את השעון.' },
   dns_slow: { t: (p) => p.ms < 0 ? 'ה-DNS לא מצליח לפענח את שם השרת' : `ה-DNS איטי (${p.ms} ms)`, d: 'פענוח שמות איטי גורם לאתרים להיטען לאט. התיקון מנקה את מטמון ה-DNS.' },
+  adapter_disabled: { t: () => 'כרטיס הרשת מושבת', d: 'כרטיס הרשת כבוי ולכן אין חיבור. התיקון מפעיל אותו.' },
+  adapter_down: { t: () => 'אין כרטיס רשת פעיל', d: 'כבל הרשת כנראה מנותק, או ש-Wi-Fi כבוי או מחוץ לטווח. אי אפשר לתקן את זה מרחוק, צריך לבדוק פיזית את הכבל או הנתב.' },
+  apipa: { t: (p) => `אין כתובת IP תקינה (${p.ip || 'ללא'})`, d: 'המחשב לא קיבל כתובת מהנתב (DHCP). התיקון מבקש כתובת חדשה.' },
+  no_gateway: { t: () => 'לא מוגדר נתב (Gateway)', d: 'בלי נתב אין יציאה מהרשת המקומית. התיקון מבקש הגדרות חדשות מהנתב.' },
+  gw_unreachable: { t: (p) => `הנתב (${p.gw}) לא עונה`, d: 'המחשב מחובר לרשת אבל הנתב לא מגיב. התיקון מאתחל את כרטיס הרשת. אם זה לא עוזר, הבעיה בנתב, במתג או בכבל.' },
+  proxy_set: { t: () => 'מוגדר פרוקסי של המערכת', d: (p) => `${p.line || ''} - פרוקסי שגוי יכול לשבור את החיבור. לא משנים אותו אוטומטית, כי סינון עשוי להצריך אותו.` },
+  hosts_override: { t: (p) => `קובץ hosts מנתב את ${p.host} למקום אחר`, d: 'מישהו או משהו שינה את קובץ ה-hosts, וזה מונע מהמחשב להגיע לשרת. צריך למחוק את השורה ידנית (C:\\Windows\\System32\\drivers\\etc\\hosts).' },
   power_saver: { t: () => 'תוכנית החשמל היא "חיסכון באנרגיה"', d: 'התוכנית הזו מאטה את המעבד בכוונה. התיקון עובר לתוכנית "מאוזן".' },
   pending_reboot: { t: () => 'Windows מחכה לאתחול', d: 'עדכון או התקנה לא הושלמו עד שיתבצע אתחול, וזה גורם לאיטיות. מומלץ לאתחל.', act: 'restart' },
   long_uptime: { t: (p) => `המחשב דלוק ${p.days} ימים בלי אתחול`, d: 'אתחול מנקה תהליכים תקועים ומשלים עדכונים.', act: 'restart' },
@@ -799,6 +811,10 @@ const FIX_INFO = {
   sync_time: { l: 'סנכרן שעון', c: 'לסנכרן את שעון המחשב?' },
   flush_dns: { l: 'נקה DNS', c: 'לנקות את מטמון ה-DNS?' },
   repair_wmi: { l: 'תקן WMI', c: 'לבדוק ולתקן את מאגר ה-WMI ולסנכרן מוני ביצועים? זה לא מאתחל את המחשב.' },
+  renew_ip: { l: 'בקש כתובת IP חדשה', c: 'לשחרר ולחדש את כתובת ה-IP (DHCP)? החיבור יתנתק לכמה שניות.' },
+  restart_adapter: { l: 'אתחל כרטיס רשת', c: 'לאתחל את כרטיס הרשת? החיבור יתנתק לכמה שניות ואם אתה בשליטה מרחוק היא תיפול.' },
+  enable_adapter: { l: 'הפעל כרטיס רשת', c: 'להפעיל את כרטיס הרשת המושבת?' },
+  reset_network_stack: { l: 'איפוס מלא של הרשת', c: 'לאפס את מחסנית הרשת של Windows (winsock ו-TCP/IP)? זה פותר בעיות רשת עקשניות, ויש אחר כך לאתחל את המחשב כדי שיכנס לתוקף.' },
   power_balanced: { l: 'תוכנית "מאוזן"', c: 'להחליף את תוכנית החשמל ל"מאוזן"?' },
 };
 let repairWatch = null, fixWatch = null;
@@ -853,7 +869,7 @@ function renderRepair(c, diag) {
       return `<div class="evRow" style="align-items:flex-start"><span>${SEV_ICON[f.sev] || ''}</span><div style="flex:1"><b>${esc(m.t(f.p))}</b><div class="sysSub2" style="margin:2px 0 6px">${esc(desc)}</div>${btns}</div></div>`;
     }).join('');
   }
-  html += '<div style="margin-top:14px"><button id="rescan" class="small" type="button">\u{1F504} סרוק שוב</button></div>';
+  html += '<div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap"><button id="rescan" class="small" type="button">\u{1F504} סרוק שוב</button><button class="small" data-fix="reset_network_stack" type="button" title="פותר בעיות רשת עקשניות. דורש אתחול אחרי">\u{1F6E0} איפוס מלא של הרשת</button></div>';
   body.innerHTML = html;
   body.querySelectorAll('button[data-fix]').forEach((b) => { b.onclick = () => applyFixes(c, [b.dataset.fix]); });
   const fa = $('fixAll'); if (fa) fa.onclick = () => applyFixes(c, fixIds);

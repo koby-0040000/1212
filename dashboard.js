@@ -32,7 +32,7 @@ const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick u
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
 const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose']);
-const FIXES = new Set(['clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced']);
+const FIXES = new Set(['clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack']);
 
 // Version fingerprint of the agent script this server is serving (normalised, ASCII). Agents report
 // the fingerprint of the script they are running, so the dashboard can show who still needs the update.
@@ -188,7 +188,7 @@ const isCurrent = (c) => !!(AGENT_VER && c.stats && c.stats.ver === AGENT_VER);
 const view = (c) => ({
   number: c.number, name: c.name || '', hostname: c.hostname || '',
   online: isOnline(c), connState: connState(c), busy: isOnline(c) && !!c.busy,
-  logAt: c.logAt || null,
+  logAt: c.logAt || null, lastOutage: c.lastOutage || null,
   diagAt: c.diagAt || null, diagCount: c.diag ? c.diag.findings.filter((f) => f.sev !== 'ok').length : null, fixAt: c.fixAt || null,
   // "removing..." only while the computer has not come back with a heartbeat after the command;
   // if it is still alive 20s later the removal did not happen -> report a failure instead of hanging.
@@ -384,6 +384,20 @@ router.post('/agent/heartbeat', (req, res) => {
   if (typeof body.rttMs === 'number' && body.rttMs >= 0 && body.rttMs < 60000) { c.rttMs = Math.round(body.rttMs); c.rttAt = now; }
   const ni = cleanNetInfo(body.netinfo);
   if (ni) { c.netinfo = ni; c.netinfoAt = now; }
+  const og = body.outage;
+  if (og && typeof og === 'object' && Number(og.secs) >= 20) {
+    const CAUSE = { dns: 'שרת השמות (DNS) לא ענה', timeout: 'פסק זמן - אין תגובה מהשרת', no_route: 'אין נתיב לרשת או לשרת', tls: 'שגיאת הצפנה/תעודה (בדוק שעון המחשב וסינון)', proxy: 'בעיית פרוקסי', server: 'השרת עצמו לא היה זמין (עדכון/הפעלה מחדש)', auth: 'שגיאת הרשאה', other: 'סיבה לא ידועה' };
+    const cause = CAUSE[og.cause] ? og.cause : 'other';
+    const l = og.local && typeof og.local === 'object' ? og.local : null;
+    c.lastOutage = {
+      at: now, secs: Math.min(Math.round(Number(og.secs)), 7 * 86400), cause,
+      msg: String(og.msg || '').slice(0, 120), heals: String(og.heals || '').slice(0, 400),
+      local: l ? { adapter: !!l.adapter, ip: String(l.ip || '').slice(0, 45), gw: !!l.gw, inet: !!l.inet, dns: !!l.dns } : null,
+    };
+    const mins = Math.max(1, Math.round(c.lastOutage.secs / 60));
+    const where = l ? (!l.adapter ? ' כרטיס הרשת לא פעיל.' : !l.gw ? ' הנתב לא ענה (בעיה ברשת המקומית).' : !l.inet ? ' הרשת המקומית תקינה אבל אין אינטרנט.' : '') : '';
+    addEvent(c.number, 'info', `הייתה הפסקת תקשורת של ${mins} דקות. סיבה: ${CAUSE[cause]}.${where}${c.lastOutage.heals ? ' תיקון אוטומטי: ' + c.lastOutage.heals : ''}`);
+  }
   const dg = cleanDiag(body.diag);
   if (dg) { c.diag = dg; c.diagAt = now; }
   const fr = cleanFixResults(body.fixResults);
