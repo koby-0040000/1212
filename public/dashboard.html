@@ -173,7 +173,7 @@
       <div class="logo">&#128421;</div>
       <div>
         <h1>מחשבים מרוחקים</h1>
-        <div class="live"><i></i> מתעדכן אוטומטית</div>
+        <div class="live"><i></i> מתעדכן אוטומטית · גרסה עדכנית: <b id="curVer">...</b></div>
       </div>
     </div>
     <div class="chips">
@@ -330,6 +330,7 @@ function paint(entry, c) {
     if (c.rttMs != null) tag('\u{1F4F6} ' + c.rttMs + ' ms', c.rttMs < 300 ? '' : 'warn');
     tag(st.vnc ? '\u2714 VNC מוכן' : '\u26A0 VNC לא זמין', st.vnc ? 'ok' : 'warn');
     if (c.diagAt && c.diagCount != null && Date.now() - c.diagAt < 6 * 3600e3) tag(c.diagCount ? '\u{1FA7A} ' + c.diagCount + ' בעיות' : '\u{1FA7A} תקין', c.diagCount ? 'warn' : 'ok');
+    tag('\u{1F3F7} גרסה ' + (st.ver || '?'), c.upToDate ? 'ok' : 'warn');
     if (!c.upToDate) tag('\u2B06 ממתין לעדכון סוכן', 'warn');
   }
   r.go.disabled = !(c.online || c.connState === 'unstable') || c.uninstalling;
@@ -373,7 +374,7 @@ function render() {
 async function refresh() {
   try {
     const r = await api('/computers');
-    data = r.computers;
+    data = r.computers; window.curAgentVer = r.agentVer || ''; $('curVer').textContent = window.curAgentVer || '?';
     $('sOnline').textContent = r.online; $('sTotal').textContent = r.total; $('sUnst').textContent = r.unstable || 0; $('sOff').textContent = r.total - r.online - (r.unstable || 0);
     render(); updateBulk();
     checkSysInfoWatch();

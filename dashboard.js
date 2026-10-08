@@ -235,6 +235,7 @@ router.get('/computers', requireAuth, (_req, res) => {
   const list = [...computers.values()].map(view);
   res.json({
     serverTime: Date.now(),
+    agentVer: AGENT_VER,
     total: list.length,
     online: list.filter((c) => c.online).length,
     unstable: list.filter((c) => c.connState === 'unstable').length,
