@@ -111,6 +111,7 @@ function Run-Command([string]$cmd) {
       'shutdown' { & shutdown.exe /s /t 5 /f }
       'uninstall' { Start-Uninstall }
       'sysinfo'  { Start-SysInfoJob }
+      'inventory' { Start-InventoryJob }
       'nettest'  { Start-NetTestJob }
       'diagnose' { Start-DiagJob }
       'getlog'   { try { $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction Stop) -join "`n") } catch { $script:LogTail = '(no log yet)' } }
@@ -158,6 +159,7 @@ function Handle-Reply($r) {
   if ($r -and $r.commands) { foreach ($c in @($r.commands)) { Run-Command ([string]$c) } }
   if ($r -and $r.fixes) { foreach ($x in @($r.fixes)) { $id = [string]$x; if ($id -match '^[a-z_]{3,24}$') { $script:FixQueue.Enqueue($id) } } }
   if ($r -and $r.kills) { foreach ($k in @($r.kills)) { Kill-Proc $k } }
+  if ($r -and $r.wake) { foreach ($w in @($r.wake)) { Send-Wake $w } }
 }
 
 # Control channel used by the viewer's Ctrl+Alt+Del button (same JSON protocol as the kiosk app).
@@ -182,7 +184,7 @@ function Test-Vnc {
 }
 
 function Get-Stats {
-  $s = @{ agent = '4'; ver = $script:MyVer; vnc = (Test-Vnc) }
+  $s = @{ agent = '5'; ver = $script:MyVer; vnc = (Test-Vnc) }
   try {
     $os = Get-CimInstance Win32_OperatingSystem
     $s.os = [string]$os.Caption
@@ -204,7 +206,146 @@ function Get-Stats {
     $ip = [Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | Where-Object { $_.AddressFamily -eq 'InterNetwork' -and -not $_.ToString().StartsWith('169.254') } | Select-Object -First 1
     if ($ip) { $s.ip = $ip.ToString() }
   } catch { }
+  # LAN identity (cheap .NET call, no WMI): MAC + IP + prefix + gateway of every active adapter.
+  # The server remembers the MAC so it can wake this computer with Wake-on-LAN while it is off.
+  try {
+    $lan = @()
+    foreach ($ni in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+      if ($ni.OperationalStatus -ne 'Up') { continue }
+      if ($ni.NetworkInterfaceType -eq 'Loopback' -or $ni.NetworkInterfaceType -eq 'Tunnel') { continue }
+      $mb = $ni.GetPhysicalAddress().GetAddressBytes()
+      if ($mb.Length -ne 6) { continue }
+      $props = $ni.GetIPProperties()
+      $v4 = $props.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and -not $_.Address.ToString().StartsWith('169.254') } | Select-Object -First 1
+      if (-not $v4) { continue }
+      $gwa = $props.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.ToString() -ne '0.0.0.0' } | Select-Object -First 1
+      $gws = ''; if ($gwa) { $gws = $gwa.Address.ToString() }
+      $lan += @{ mac = (($mb | ForEach-Object { $_.ToString('X2') }) -join ':'); ip = $v4.Address.ToString(); prefix = [int]$v4.PrefixLength; gw = $gws; wifi = ($ni.NetworkInterfaceType -eq 'Wireless80211') }
+    }
+    if ($lan.Count -gt 0) { $s.lan = @($lan | Select-Object -First 4) }
+  } catch { }
   return $s
+}
+
+# ---- hardware inventory (on demand + once a day, in a background job like sysinfo/nettest) ----
+# Read-only: manufacturer, model, serial, BIOS, board, CPU, RAM modules, disks, GPU, OS and network adapters.
+function Get-Inventory {
+  $inv = @{}
+  $t0 = Get-Date
+  try {
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    $inv.manufacturer = [string]$cs.Manufacturer; $inv.model = [string]$cs.Model
+    $inv.ramBytes = [double]$cs.TotalPhysicalMemory
+    $inv.domain = [string]$cs.Domain; $inv.partOfDomain = [bool]$cs.PartOfDomain
+  } catch { }
+  try {
+    $b = Get-CimInstance Win32_BIOS -ErrorAction Stop | Select-Object -First 1
+    $inv.serial = [string]$b.SerialNumber; $inv.biosVersion = [string]$b.SMBIOSBIOSVersion
+    if ($b.ReleaseDate) { $inv.biosDate = $b.ReleaseDate.ToString('yyyy-MM-dd') }
+  } catch { }
+  try {
+    $bb = Get-CimInstance Win32_BaseBoard -ErrorAction Stop | Select-Object -First 1
+    $inv.boardMaker = [string]$bb.Manufacturer; $inv.board = [string]$bb.Product
+  } catch { }
+  try {
+    $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+    $inv.cpu = ([string]$cpu.Name).Trim(); $inv.cores = [int]$cpu.NumberOfCores; $inv.threads = [int]$cpu.NumberOfLogicalProcessors; $inv.maxMhz = [int]$cpu.MaxClockSpeed
+  } catch { }
+  try {
+    $inv.ramModules = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | ForEach-Object {
+      @{ gb = [math]::Round([double]$_.Capacity / 1GB, 1); mhz = [int]$_.Speed; maker = ([string]$_.Manufacturer).Trim(); part = ([string]$_.PartNumber).Trim(); slot = [string]$_.DeviceLocator }
+    })
+  } catch { }
+  try {
+    $pd = @{}
+    try { foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop)) { $pd[[string]$d.FriendlyName] = [string]$d.MediaType } } catch { }
+    $inv.disks = @(Get-CimInstance Win32_DiskDrive -ErrorAction Stop | ForEach-Object {
+      $mt = ''; if ($pd.ContainsKey([string]$_.Model)) { $mt = $pd[[string]$_.Model] }
+      @{ model = ([string]$_.Model).Trim(); gb = [math]::Round([double]$_.Size / 1GB); type = $mt; bus = [string]$_.InterfaceType }
+    })
+  } catch { }
+  try {
+    $inv.volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | ForEach-Object {
+      @{ id = [string]$_.DeviceID; label = [string]$_.VolumeName; fs = [string]$_.FileSystem; totalGb = [math]::Round([double]$_.Size / 1GB); freeGb = [math]::Round([double]$_.FreeSpace / 1GB) }
+    })
+  } catch { }
+  try {
+    $inv.gpus = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {
+      $mb = 0; if ($_.AdapterRAM -gt 0) { $mb = [math]::Round([double]$_.AdapterRAM / 1MB) }
+      @{ name = [string]$_.Name; driver = [string]$_.DriverVersion; mb = $mb }
+    })
+  } catch { }
+  try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $inv.os = [string]$os.Caption; $inv.osVersion = [string]$os.Version; $inv.osBuild = [string]$os.BuildNumber; $inv.osArch = [string]$os.OSArchitecture
+    if ($os.InstallDate) { $inv.osInstall = $os.InstallDate.ToString('yyyy-MM-dd') }
+    if ($os.LastBootUpTime) { $inv.lastBoot = $os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm') }
+  } catch { }
+  try { $inv.timeZone = [string](Get-TimeZone).Id } catch { }
+  try {
+    $nics = @()
+    foreach ($a in @(Get-NetAdapter -Physical -ErrorAction Stop)) {
+      $wol = ''
+      try { $pm = Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction Stop; $wol = [string]$pm.WakeOnMagicPacket } catch { }
+      $ipv4 = ''
+      try { $ipv4 = [string](Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1).IPAddress } catch { }
+      $nics += @{ name = [string]$a.Name; desc = [string]$a.InterfaceDescription; mac = ([string]$a.MacAddress).Replace('-', ':'); status = [string]$a.Status; mbps = [math]::Round([double]$a.Speed / 1e6); wifi = [bool]($a.PhysicalMediaType -like '*802.11*'); ip = $ipv4; wol = $wol }
+    }
+    $inv.nics = @($nics)
+  } catch { }
+  $inv.took = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+  return $inv
+}
+
+# ---- Wake-on-LAN relay ----
+# The server (on the internet) cannot reach a powered-off computer, so it asks an ONLINE agent on the same LAN to
+# broadcast the magic packet. Only a MAC address is taken from the server; nothing else is executed.
+$script:WakeResults = @()
+function Send-Wake($w) {
+  $res = @{ number = [string]$w.number; mac = [string]$w.mac; ok = $false; msg = '' }
+  try {
+    $hex = ([string]$w.mac -replace '[^0-9A-Fa-f]', '')
+    if ($hex.Length -ne 12) { throw 'bad mac address' }
+    $macb = New-Object byte[] 6
+    for ($i = 0; $i -lt 6; $i++) { $macb[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
+    $pkt = New-Object byte[] 102
+    for ($i = 0; $i -lt 6; $i++) { $pkt[$i] = 255 }
+    for ($i = 0; $i -lt 16; $i++) { [Array]::Copy($macb, 0, $pkt, 6 + $i * 6, 6) }
+    $extra = ''
+    if ($w.bcast -and ([string]$w.bcast) -match '^\d{1,3}(\.\d{1,3}){3}$') { $extra = [string]$w.bcast }
+    $sent = 0; $nets = 0
+    foreach ($ni in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+      if ($ni.OperationalStatus -ne 'Up' -or $ni.NetworkInterfaceType -eq 'Loopback' -or $ni.NetworkInterfaceType -eq 'Tunnel') { continue }
+      foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
+        if ($ua.Address.AddressFamily -ne 'InterNetwork' -or $ua.Address.ToString().StartsWith('169.254')) { continue }
+        $ipb = $ua.Address.GetAddressBytes()
+        $pl = [int]$ua.PrefixLength
+        $bc = New-Object byte[] 4
+        for ($j = 0; $j -lt 4; $j++) {
+          $bits = [Math]::Max(0, [Math]::Min(8, $pl - 8 * $j))
+          $m = (255 -shl (8 - $bits)) -band 255
+          $bc[$j] = [byte]($ipb[$j] -bor ((-bnot $m) -band 255))
+        }
+        $dsts = @('255.255.255.255', ($bc -join '.'))
+        if ($extra) { $dsts += $extra }
+        $udp = $null
+        try {
+          $udp = New-Object Net.Sockets.UdpClient((New-Object Net.IPEndPoint($ua.Address, 0)))
+          $udp.EnableBroadcast = $true
+          for ($rep = 0; $rep -lt 2; $rep++) {
+            foreach ($d in ($dsts | Select-Object -Unique)) { foreach ($port in @(9, 7)) { try { [void]$udp.Send($pkt, $pkt.Length, $d, $port); $sent++ } catch { } } }
+            Start-Sleep -Milliseconds 150
+          }
+          $nets++
+        } catch { } finally { if ($udp) { try { $udp.Close() } catch { } } }
+      }
+    }
+    $res.ok = ($sent -gt 0)
+    $res.msg = if ($res.ok) { 'sent ' + $sent + ' packets on ' + $nets + ' network(s)' } else { 'no usable network adapter' }
+  } catch { $res.msg = 'error: ' + $_.Exception.Message }
+  if ($res.msg.Length -gt 120) { $res.msg = $res.msg.Substring(0, 120) }
+  Log ('wake-on-lan for computer ' + $res.number + ' (' + $res.mac + '): ' + $res.msg)
+  $script:WakeResults += $res
 }
 
 # On-demand only (triggered by the dashboard's sysinfo button, see the
@@ -361,6 +502,9 @@ function Start-SysInfoJob {
   $prefix = "`$script:ProtectedProcs = @($list)"
   Start-BgJob 'sysinfo' (Build-JobScript @('Get-SysInfo') $prefix 'Get-SysInfo')
 }
+function Start-InventoryJob {
+  Start-BgJob 'inventory' (Build-JobScript @('Get-Inventory') '' 'Get-Inventory')
+}
 function Start-NetTestJob {
   $k = $Key.Replace("'", "''"); $sv = $Server.Replace("'", "''")
   $prefix = "`$Server = '$sv'; `$Key = '$k'; `$Headers = @{ 'x-agent-key' = `$Key }"
@@ -375,7 +519,7 @@ function Poll-BgJobs {
       try { $val = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -Last 1 } catch { Log "background job $name failed: $($_.Exception.Message)" }
       try { $j.Ps.Dispose() } catch { }
       $script:BgJobs.Remove($name)
-      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'heal') { $script:Fail.Heals += [string]$val.text; $script:Fail.Local = $val.local; Log ('network self-heal result: ' + $val.text) } elseif ($name -eq 'diag') { $script:DiagResult = $val } elseif ($name -eq 'fix') { $script:FixResults += $val; Log ("fix result: " + $val.id + ' ok=' + $val.ok + ' ' + $val.msg) } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
+      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'inventory') { $script:Inventory = $val; $script:InvAt = Get-Date } elseif ($name -eq 'heal') { $script:Fail.Heals += [string]$val.text; $script:Fail.Local = $val.local; Log ('network self-heal result: ' + $val.text) } elseif ($name -eq 'diag') { $script:DiagResult = $val } elseif ($name -eq 'fix') { $script:FixResults += $val; Log ("fix result: " + $val.id + ' ok=' + $val.ok + ' ' + $val.msg) } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
     } elseif (((Get-Date) - $j.At).TotalSeconds -gt $(if ($name -eq 'fix') { 300 } else { 100 })) {
       Log "background job $name timed out - abandoned (the heartbeat keeps running)"
       try { [void]$j.Ps.BeginStop($null, $null) } catch { }
@@ -613,6 +757,22 @@ function Invoke-Fix([string]$id) {
         Start-Sleep -Seconds 6
         $res.ok = ($n -gt 0); $res.msg = 'enabled ' + $n + ' adapter(s)'
       }
+      'enable_wol' {
+        # Turns on "wake on magic packet" for every active physical adapter. The BIOS/UEFI option
+        # (Wake on LAN / Power on by PCI-E) must also be enabled on the computer - that cannot be done from Windows.
+        $n = 0; $notes = @()
+        foreach ($a in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })) {
+          try { Set-NetAdapterPowerManagement -Name $a.Name -WakeOnMagicPacket Enabled -ErrorAction Stop } catch { $notes += ($a.Name + ': ' + $_.Exception.Message) }
+          try {
+            $pr = Get-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*WakeOnMagicPacket' -ErrorAction Stop
+            if ($pr) { Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*WakeOnMagicPacket' -RegistryValue 1 -ErrorAction Stop }
+          } catch { }
+          try { & powercfg.exe /deviceenablewake $a.InterfaceDescription 2>&1 | Out-Null } catch { }
+          $n++
+        }
+        $res.ok = ($n -gt 0 -and $notes.Count -eq 0)
+        $res.msg = if ($n -eq 0) { 'no active adapter' } elseif ($notes.Count -gt 0) { ($notes -join ' | ') } else { 'wake-on-magic-packet enabled on ' + $n + ' adapter(s) (also enable Wake on LAN in the BIOS)' }
+      }
       'reset_network_stack' {
         netsh winsock reset | Out-Null
         netsh int ip reset | Out-Null
@@ -628,7 +788,7 @@ function Invoke-Fix([string]$id) {
 $script:FixQueue = New-Object 'System.Collections.Generic.Queue[string]'
 $script:DiagResult = $null
 $script:FixResults = @()
-$script:FixIds = @('clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack')
+$script:FixIds = @('clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack', 'enable_wol')
 function Start-DiagJob {
   $k = $Key.Replace("'", "''"); $sv = $Server.Replace("'", "''")
   $prefix = "`$Server = '$sv'; `$Key = '$k'; `$Headers = @{ 'x-agent-key' = `$Key }"
@@ -758,6 +918,8 @@ function Ensure-Watchdog {
 }
 
 $script:LastRtt = $null
+$script:Inventory = $null
+$script:InvAt = $null
 $script:Stats = $null
 $script:StatsAt = [datetime]::MinValue
 function Refresh-Stats {
@@ -780,6 +942,10 @@ function Beat([bool]$busy) {
     if ($script:FixResults.Count -gt 0) { $b.fixResults = @($script:FixResults); $script:FixResults = @() }
     if ($script:LogTail) { $b.logTail = $script:LogTail; $script:LogTail = $null }
     if ($script:LastRtt -ne $null) { $b.rttMs = $script:LastRtt }   # round-trip of the PREVIOUS heartbeat
+    $sentInv = $script:Inventory
+    if ($sentInv) { $b.inventory = $sentInv }
+    $sentWake = @($script:WakeResults)
+    if ($sentWake.Count -gt 0) { $b.wakeResults = $sentWake }
     $sentNote = $script:UpdateNote
     if ($sentNote) { $b.updateNote = $sentNote }
     $sentOutage = $script:Outage
@@ -789,6 +955,8 @@ function Beat([bool]$busy) {
     $resp = Invoke-RestMethod -Method Post -Uri "$Server/api/agent/heartbeat" -Headers $Headers -ContentType 'application/json' -Body $body -UseBasicParsing -TimeoutSec 30
     $script:LastRtt = [int]$sw.ElapsedMilliseconds
     if ($sentOutage) { $script:Outage = $null }
+    if ($sentInv -and $script:Inventory -eq $sentInv) { $script:Inventory = $null }
+    if ($sentWake.Count -gt 0) { $script:WakeResults = @($script:WakeResults | Select-Object -Skip $sentWake.Count) }
     if ($sentNote -and $script:UpdateNote -eq $sentNote) { $script:UpdateNote = '' }
     Note-Success
     return $resp
@@ -1087,6 +1255,9 @@ while ($true) {
   Step-NetHeal
   Confirm-GoodVersion
   Handle-Reply $r
+  if ($script:LastRtt -ne $null -and ((Get-Date) - $script:StartedAt).TotalSeconds -ge 20 -and (-not $script:InvAt -or ((Get-Date) - $script:InvAt).TotalHours -ge 24) -and -not $script:BgJobs.ContainsKey('inventory')) {
+    Start-InventoryJob; $script:InvAt = Get-Date
+  }
   if ($r -and $r.session) { Run-Session ([string]$r.session) }
   if (((Get-Date) - $script:LastUpdateCheck).TotalMinutes -ge 10) {
     Check-ForUpdate

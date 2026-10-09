@@ -129,3 +129,20 @@ The agent is started through `C:\ProgramData\SionyxAgent\run-agent.cmd`, which r
 `powershell -Command` instead of `powershell -File`. Reason: Group Policy / AppLocker execution policy on lab
 computers blocks `.ps1` *files* (child process exit code 1) even with `-ExecutionPolicy Bypass`.
 If `Register-ScheduledTask` fails, the installer falls back to `schtasks.exe`.
+
+### Hardware inventory and Wake-on-LAN (agent v1.0.0.2)
+
+- **Hardware details**: every card has a "hardware spec" button. The agent collects (read-only) manufacturer, model,
+  serial number, BIOS, motherboard, CPU, RAM modules, disks and volumes, graphics card, OS and install date, and every
+  network adapter with its MAC / IP / speed / Wake-on-LAN state. It is sent automatically ~20s after the agent starts
+  and then once a day, or on demand with the refresh button. The server keeps it (with the MAC addresses) in
+  `computers.json` / Upstash, so it is visible for computers that are off. The header button "export specs" downloads
+  all computers as a CSV that opens in Excel.
+- **Turn on a powered-off computer**: the card's main button becomes "turn on" (also in the "more" menu, and "turn on all
+  powered-off" in the filter bar). The server cannot reach a LAN, so it asks up to two ONLINE agents on the same subnet
+  (else the same public IP) to broadcast the magic packet (UDP 9 and 7, limited + directed broadcast). Requirements on
+  the sleeping computer: wired network, "Wake on LAN" / "Power on by PCI-E" enabled in the BIOS, and "wake on magic
+  packet" enabled in Windows - the spec window has a button that does the Windows part remotely (`enable_wol` fix).
+  If the computer shows a green "wake" state on its network adapter but still does not start, it is almost always the BIOS option.
+- The MAC of a computer is learned from its heartbeat, so a computer must have connected once with this agent version
+  before it can be woken. Wake relays report back to the events window.

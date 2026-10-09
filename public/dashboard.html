@@ -185,6 +185,7 @@
     <div class="tools">
       <input id="q" type="text" placeholder="&#128269; חיפוש מספר / שם">
       <button id="evBtn" type="button" title="אירועים, התראות והגדרות">&#128276; אירועים</button>
+      <button id="csvBtn" type="button" title="ייצוא מפרט החומרה של כל המחשבים לקובץ CSV (נפתח באקסל)">&#128203; ייצוא מפרטים</button>
       <a href="/api/installer" download><button class="primary" id="instBtn" type="button">&#11015; הורד מתקין</button></a>
       <button id="logout">יציאה</button>
     </div>
@@ -194,6 +195,7 @@
     <button class="f" data-f="off">לא מחוברים</button>
     <button class="f" data-f="hot">עומס גבוה</button>
     <button class="f" data-f="stale">לא מעודכנים</button>
+    <button class="f" id="wakeAll" type="button" title="שלח Wake-on-LAN לכל המחשבים הכבויים שידועה להם כתובת רשת">&#9211; הדלק את כל הכבויים</button>
     <button class="f" id="selAll" title="סמן את כל המחשבים המחוברים (לפי הסינון)">&#9745; בחר מחוברים</button>
     <div id="bulk">
       <b id="bulkN"></b>
@@ -283,21 +285,23 @@ function makeCard(c) {
   const row = el('div', 'row');
   const go = el('button', 'primary', 'התחבר');
   const cmd = el('select', 'small'); cmd.title = 'עוד פעולות';
-  for (const [v, t] of [['', '\u22EF עוד...'], ['rename', 'שינוי שם'], ['getlog', 'יומן סוכן'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['restart', 'אתחול'], ['shutdown', 'כיבוי'], ['restartfilter', 'הפעל מחדש שירותי סינון'], ['forget', 'הסר מהרשימה'], ['uninstall', 'הסר תוכנה מהמחשב']]) {
+  for (const [v, t] of [['', '\u22EF עוד...'], ['rename', 'שינוי שם'], ['getlog', 'יומן סוכן'], ['cad', 'Ctrl+Alt+Del'], ['lock', 'נעילה'], ['logoff', 'התנתקות משתמש'], ['wake', '\u23FB הדלק מחשב (Wake-on-LAN)'], ['restart', 'אתחול'], ['shutdown', 'כיבוי'], ['restartfilter', 'הפעל מחדש שירותי סינון'], ['forget', 'הסר מהרשימה'], ['uninstall', 'הסר תוכנה מהמחשב']]) {
     const o = el('option', null, t); o.value = v; cmd.appendChild(o);
   }
   const sys = el('button', 'small half', '\u{1F4CA} פרטי מחשב'); sys.title = 'דגם המעבד, מה מעמיס עליו כרגע, ואפשרות לסיים תהליכים';
   const rep_ = el('button', 'small half', '\u{1FA7A} בדוק ותקן'); rep_.title = 'סורק את המחשב לבעיות נפוצות (איטיות, דיסק מלא, שירותים כבויים, שעון...) ומציע תיקונים';
-  row.append(go, cmd, sys, rep_);
+  const inv = el('button', 'small wide', '\u{1F9FE} מפרט חומרה'); inv.title = 'יצרן, דגם, מספר סידורי, מעבד, זיכרון, דיסקים, כרטיס מסך, כרטיסי רשת וכתובות MAC';
+  row.append(go, cmd, sys, rep_, inv);
   card.append(top, sub, seen, note, gauges, tags, row);
   card.addEventListener('animationend', () => card.classList.remove('enter'), { once: true });
-  const entry = { el: card, c, refs: { numTxt, sel, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, sys, rep: rep_ } };
-  go.onclick = () => connect(entry.c, go);
+  const entry = { el: card, c, refs: { numTxt, sel, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, sys, rep: rep_, inv } };
+  go.onclick = () => { const x = entry.c; if (!x.online && x.connState !== 'unstable' && x.canWake) wakeComputer(x, go); else connect(x, go); };
+  inv.onclick = () => openInventory(entry.c);
   numTxt.onclick = () => rename(entry.c);
   sel.onchange = () => { if (sel.checked) selected.add(entry.c.number); else selected.delete(entry.c.number); updateBulk(); };
   cmd.onchange = () => {
     const v = cmd.value; cmd.value = ''; cmd.blur();
-    if (v === 'rename') rename(entry.c); else if (v === 'forget') forget(entry.c); else if (v === 'getlog') openLog(entry.c); else sendCommand(entry.c, v);
+    if (v === 'rename') rename(entry.c); else if (v === 'forget') forget(entry.c); else if (v === 'getlog') openLog(entry.c); else if (v === 'wake') wakeComputer(entry.c, null); else sendCommand(entry.c, v);
   };
   sys.onclick = () => openSysInfo(entry.c, sys);
   rep_.onclick = () => openRepair(entry.c);
@@ -333,12 +337,15 @@ function paint(entry, c) {
     const vt = tag('\u{1F3F7} גרסה ' + (c.verLabel || st.ver || '?'), c.upToDate ? 'ok' : 'warn'); vt.title = 'מזהה: ' + (st.ver || '?');
     if (!c.upToDate) tag('\u2B06 ממתין לעדכון סוכן', 'warn');
   }
-  r.go.disabled = !(c.online || c.connState === 'unstable') || c.uninstalling;
+  const wakeable = !c.online && c.connState !== 'unstable' && !!c.canWake && !c.uninstalling;
+  r.go.textContent = wakeable ? (c.waking ? '\u23F3 מדליק...' : '\u23FB הדלק') : 'התחבר';
+  r.go.title = wakeable ? 'שולח Wake-on-LAN דרך מחשב דלוק אחר באותה רשת' : '';
+  r.go.disabled = wakeable ? !!c.waking : (!(c.online || c.connState === 'unstable') || c.uninstalling);
   r.cmd.disabled = c.uninstalling;
   r.sys.disabled = !c.online || c.uninstalling;
   r.rep.disabled = !c.online || c.uninstalling;
   // offline computers can only be renamed or removed from the list; online ones can't be "removed from list"
-  for (const o of r.cmd.options) { if (!o.value) continue; o.disabled = o.value === 'rename' ? false : o.value === 'forget' ? c.online : !c.online; }
+  for (const o of r.cmd.options) { if (!o.value) continue; o.disabled = o.value === 'rename' ? false : o.value === 'forget' ? c.online : o.value === 'wake' ? !c.canWake : !c.online; }
   r.sel.disabled = !c.online; r.sel.checked = c.online && selected.has(c.number);
 }
 
@@ -407,6 +414,7 @@ async function refresh() {
     checkLogWatch();
     checkRepairWatch();
     checkFixWatch();
+    checkInvWatch();
   } catch (e) { if (e.message !== 'unauthorized') console.error(e); }
 }
 
@@ -653,7 +661,7 @@ function checkSysInfoWatch() {
   sysWatch = null;
 }
 
-$('sysClose').onclick = () => { stopSysLoad(); $('sysModal').classList.add('hidden'); };
+$('sysClose').onclick = () => { stopSysLoad(); invWatch = null; $('sysModal').classList.add('hidden'); };
 $('sysModal').addEventListener('click', (e) => { if (e.target.id === 'sysModal') { stopSysLoad(); $('sysModal').classList.add('hidden'); } });
 
 async function connect(c, btn) {
@@ -669,7 +677,7 @@ async function connect(c, btn) {
   setTimeout(() => { btn.textContent = 'התחבר'; refresh(); }, 3000);
 }
 
-const CMD_LABEL = { cad: 'Ctrl+Alt+Del', lock: 'נעילה', logoff: 'התנתקות משתמש', restart: 'אתחול', shutdown: 'כיבוי', uninstall: 'הסרת התוכנה מהמחשב', restartfilter: 'הפעלה מחדש של שירותי הסינון' };
+const CMD_LABEL = { cad: 'Ctrl+Alt+Del', lock: 'נעילה', logoff: 'התנתקות משתמש', restart: 'אתחול', shutdown: 'כיבוי', uninstall: 'הסרת התוכנה מהמחשב', restartfilter: 'הפעלה מחדש של שירותי הסינון', wake: 'הדלקה (Wake-on-LAN)' };
 async function sendCommand(c, action) {
   if (!action) return;
   if (action === 'uninstall') {
@@ -701,6 +709,136 @@ async function forget(c) {
   dropKnown(c.number);
   refresh();
 }
+
+// ---------- hardware inventory + Wake-on-LAN ----------
+// The agent reports the hardware snapshot on start-up and once a day; the server keeps it (and the MAC
+// addresses) even while the computer is off, so this window also works for computers that are not connected.
+let invWatch = null; // { number, requestedAt }
+const INV_WAIT_MS = 60000;
+const kv = (k, v) => `<div><span>${k}:</span> ${v == null || v === '' ? '-' : esc(v)}</div>`;
+const fmtGb = (v) => (v == null ? '-' : v >= 1000 ? (v / 1000).toFixed(1) + ' TB' : v + ' GB');
+const WOL_TXT = { Enabled: '\u2714 מופעל', Disabled: '\u26A0 כבוי', '': 'לא ידוע' };
+
+function invModalOpen() { return !$('sysModal').classList.contains('hidden') && $('sysTitle').textContent.indexOf('מפרט חומרה') >= 0; }
+
+function openInventory(c) {
+  stopSysLoad(); sysWatch = null; repairWatch = null;
+  $('sysModal').classList.remove('hidden');
+  renderInventory(c);
+}
+
+function renderInventory(c) {
+  const v = c.inventory;
+  $('sysTitle').textContent = '\u{1F9FE} מפרט חומרה - מחשב ' + c.number;
+  const body = $('sysBody');
+  const lan = (c.lan || []).map((x) => `${esc(x.mac)} (${esc(x.ip)}${x.wifi ? ', Wi-Fi' : ''})`).join('<br>');
+  const wakeBtn = !c.online && c.canWake ? '<button id="invWake" class="small primary" type="button">\u23FB הדלק מחשב</button> ' : '';
+  const refBtn = c.online ? '<button id="invRefresh" class="small" type="button">\u{1F504} רענן מהמחשב</button> <button id="invWol" class="small" type="button" title="מפעיל wake on magic packet בכרטיס הרשת של המחשב (צריך גם להפעיל Wake on LAN ב-BIOS)">\u26A1 הפעל Wake-on-LAN בכרטיס הרשת</button>' : '';
+  const head = `<div class="sysSub2">${v ? 'נאסף ' + ago(c.inventoryAt) : 'עדיין לא נאסף מפרט ממחשב זה.'}${c.online ? '' : ' · המחשב לא מחובר - מוצג המידע השמור'}</div>
+    <div class="netHead"><span>כתובות רשת (MAC / IP)</span></div>${lan ? `<div class="sysSub2" style="direction:ltr;text-align:right">${lan}</div>` : '<div class="sysSub2">לא ידועה כתובת רשת. היא נקלטת כשהסוכן המעודכן מתחבר.</div>'}
+    <div style="margin:0 0 12px">${wakeBtn}${refBtn}</div>`;
+  if (!v) {
+    body.innerHTML = head + (c.online ? '<div class="sysLoading">הסוכן אוסף את המפרט אוטומטית תוך כדקה מהעדכון, או לחץ \"רענן מהמחשב\".</div>' : '<div class="sysLoading">אין עדיין נתונים. הם יישמרו כשהמחשב יתחבר בגרסת הסוכן החדשה.</div>');
+  } else {
+    const ghz = v.maxMhz ? (v.maxMhz / 1000).toFixed(1) + ' GHz' : '';
+    const tbl = (heads, rows, empty) => `<table class="sysTbl"><tr>${heads.map((h) => `<th>${h}</th>`).join('')}</tr>${rows.length ? rows.map((r) => `<tr>${r.map((x) => `<td>${esc(x == null || x === '' ? '-' : x)}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${heads.length}" style="color:var(--muted)">${empty}</td></tr>`}</table>`;
+    const sec = (t) => `<div class="netHead" style="margin-top:14px"><span>${t}</span></div>`;
+    body.innerHTML = head
+      + sec('מחשב')
+      + `<div class="sysGrid">${kv('יצרן', v.manufacturer)}${kv('דגם', v.model)}${kv('מספר סידורי', v.serial)}${kv('BIOS', [v.biosVersion, v.biosDate].filter(Boolean).join(' · '))}${kv('לוח אם', [v.boardMaker, v.board].filter(Boolean).join(' '))}${kv('דומיין / קבוצת עבודה', (v.partOfDomain ? 'דומיין: ' : 'קבוצת עבודה: ') + (v.domain || ''))}</div>`
+      + sec('מעבד וזיכרון')
+      + `<div class="sysGrid">${kv('מעבד', v.cpu)}${kv('ליבות / תהליכונים', (v.cores || '-') + ' / ' + (v.threads || '-') + (ghz ? ' · ' + ghz : ''))}${kv('זיכרון כולל', v.ramGb != null ? v.ramGb + ' GB' : '')}</div>`
+      + tbl(['חריץ', 'גודל', 'מהירות', 'יצרן / דגם'], (v.ramModules || []).map((m) => [m.slot, m.gb != null ? m.gb + ' GB' : '', m.mhz ? m.mhz + ' MHz' : '', [m.maker, m.part].filter(Boolean).join(' ')]), 'אין פירוט מודולים')
+      + sec('דיסקים')
+      + tbl(['דיסק', 'גודל', 'סוג'], (v.disks || []).map((d) => [d.model, fmtGb(d.gb), [d.type, d.bus].filter(Boolean).join(' / ')]), 'אין נתונים')
+      + tbl(['כונן', 'שם', 'מערכת קבצים', 'גודל', 'פנוי'], (v.volumes || []).map((d) => [d.id, d.label, d.fs, fmtGb(d.totalGb), fmtGb(d.freeGb)]), 'אין נתונים')
+      + sec('כרטיס מסך')
+      + tbl(['כרטיס', 'זיכרון', 'דרייבר'], (v.gpus || []).map((g) => [g.name, g.mb ? fmtGb(g.mb) : '', g.driver]), 'אין נתונים')
+      + sec('מערכת הפעלה')
+      + `<div class="sysGrid">${kv('מערכת', v.os)}${kv('גרסה', [v.osVersion, v.osBuild ? 'build ' + v.osBuild : '', v.osArch].filter(Boolean).join(' · '))}${kv('הותקנה', v.osInstall)}${kv('אתחול אחרון', v.lastBoot)}${kv('אזור זמן', v.timeZone)}</div>`
+      + sec('כרטיסי רשת')
+      + tbl(['כרטיס', 'MAC', 'IP', 'מהירות', 'Wake-on-LAN'], (v.nics || []).map((n) => [n.name + (n.wifi ? ' (Wi-Fi)' : '') + (n.status && n.status !== 'Up' ? ' - ' + n.status : ''), n.mac, n.ip, n.mbps ? n.mbps + ' Mbps' : '', WOL_TXT[n.wol] || n.wol]), 'אין נתונים');
+  }
+  const w = $('invWake'); if (w) w.onclick = () => wakeComputer(c, w);
+  const rf = $('invRefresh'); if (rf) rf.onclick = () => requestInventory(c, rf);
+  const wl = $('invWol'); if (wl) wl.onclick = () => enableWol(c, wl);
+}
+
+async function requestInventory(c, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'מבקש...'; }
+  invWatch = { number: c.number, requestedAt: Date.now() };
+  try { await api(`/computers/${encodeURIComponent(c.number)}/command`, { method: 'POST', body: { action: 'inventory' } }); }
+  catch (e) { invWatch = null; toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err'); if (btn) { btn.disabled = false; btn.textContent = '\u{1F504} רענן מהמחשב'; } }
+}
+
+function checkInvWatch() {
+  if (!invWatch) return;
+  const c = data.find((x) => x.number === invWatch.number);
+  const fresh = c && c.inventoryAt && c.inventoryAt >= invWatch.requestedAt;
+  const timedOut = Date.now() - invWatch.requestedAt > INV_WAIT_MS;
+  if (!fresh && !timedOut) return;
+  invWatch = null;
+  if (fresh) { if (invModalOpen()) renderInventory(c); toast('המפרט התעדכן', 'ok'); }
+  else { if (invModalOpen() && c) renderInventory(c); toast('המחשב לא החזיר מפרט בזמן. ייתכן שהוא עמוס או בשליטה (VNC).', 'err'); }
+}
+
+async function enableWol(c, btn) {
+  if (!confirm(`להפעיל Wake-on-LAN בכרטיס הרשת של מחשב ${c.number}?\n\nזה מפעיל את האפשרות \"wake on magic packet\" ב-Windows. כדי שההדלקה תעבוד צריך גם שהאפשרות Wake on LAN (או Power on by PCI-E) תהיה מופעלת ב-BIOS של המחשב, והמחשב חייב להיות מחובר בכבל רשת.`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/computers/${encodeURIComponent(c.number)}/fix`, { method: 'POST', body: { ids: ['enable_wol'] } });
+    toast('הפעולה נשלחה. התוצאה תופיע ב\"אירועים\" תוך כמה שניות.', 'ok');
+  } catch (e) { toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err'); }
+  if (btn) btn.disabled = false;
+}
+
+const WAKE_ERR = {
+  no_mac: 'עדיין לא ידועה כתובת הרשת (MAC) של המחשב. היא נקלטת כשהסוכן המעודכן מתחבר לפחות פעם אחת.',
+  no_relay: 'אין מחשב דלוק אחר באותה רשת שיכול לשלוח את הפקודה (צריך מחשב פעיל עם הסוכן המעודכן, שאינו בשליטה כרגע).',
+  already_online: 'המחשב כבר דלוק.',
+};
+async function wakeComputer(c, btn) {
+  if (!confirm(`להדליק את מחשב ${c.number} (Wake-on-LAN)?\n\nהפקודה נשלחת דרך מחשב דלוק אחר באותה רשת. זה עובד רק אם Wake on LAN מופעל ב-BIOS ובכרטיס הרשת של המחשב, והוא מחובר בכבל.`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api(`/computers/${encodeURIComponent(c.number)}/wake`, { method: 'POST' });
+    toast(`פקודת הדלקה נשלחה למחשב ${c.number} דרך מחשב ${(r.via || []).join(', ')}. ההדלקה לוקחת בדרך כלל דקה-שתיים.`, 'ok');
+    refresh();
+  } catch (e) {
+    toast(WAKE_ERR[e.message] || 'שגיאה: ' + e.message, 'err');
+    if (btn) btn.disabled = false;
+  }
+}
+
+$('wakeAll').onclick = async () => {
+  const targets = data.filter((c) => c.canWake && !c.waking && !c.ghost);
+  if (!targets.length) { toast('אין מחשבים כבויים שאפשר להדליק (חסרה כתובת רשת, או שכולם דלוקים).', 'err'); return; }
+  if (!confirm(`לשלוח Wake-on-LAN ל-${targets.length} מחשבים כבויים?\n${targets.map((c) => c.number).join(', ')}`)) return;
+  let ok = 0; const bad = [];
+  for (const c of targets) {
+    try { await api(`/computers/${encodeURIComponent(c.number)}/wake`, { method: 'POST' }); ok++; }
+    catch (e) { bad.push(c.number + (e.message === 'no_relay' ? ' (אין מחשב דלוק ברשת)' : '')); }
+  }
+  toast(`נשלחה הדלקה ל-${ok} מחשבים` + (bad.length ? `. נכשל: ${bad.join(', ')}` : ''), bad.length ? 'err' : 'ok');
+  refresh();
+};
+
+// one row per computer, opens in Excel (UTF-8 BOM so Hebrew shows correctly)
+$('csvBtn').onclick = () => {
+  const q = (x) => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"';
+  const head = ['מספר', 'שם', 'שם מחשב', 'מצב', 'יצרן', 'דגם', 'מספר סידורי', 'מעבד', 'ליבות', 'זיכרון GB', 'דיסקים', 'כרטיס מסך', 'מערכת הפעלה', 'כתובות MAC', 'IP', 'נאסף'];
+  const rows = [...data].sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true })).map((c) => {
+    const v = c.inventory || {};
+    return [c.number, c.name, c.hostname, c.online ? 'פעיל' : 'לא מחובר', v.manufacturer, v.model, v.serial, v.cpu, v.cores, v.ramGb,
+      (v.disks || []).map((d) => `${d.model} ${d.gb}GB`).join(' + '), (v.gpus || []).map((g) => g.name).join(' + '), v.os,
+      (c.lan || []).map((x) => x.mac).join(' '), (c.lan || []).map((x) => x.ip).join(' '), c.inventoryAt ? new Date(c.inventoryAt).toLocaleString('he-IL') : ''];
+  });
+  const csv = '\uFEFF' + [head, ...rows].map((r) => r.map(q).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  a.download = 'sionyx-computers-' + new Date().toISOString().slice(0, 10) + '.csv';
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+};
 
 // ---------- filters + bulk ----------
 document.querySelectorAll('#bar .f[data-f]').forEach((b) => { b.onclick = () => {

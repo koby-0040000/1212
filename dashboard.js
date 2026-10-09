@@ -31,8 +31,8 @@ const COOKIE_TTL_MS = 12 * 3600 * 1000;
 const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick up within this time
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
-const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose']);
-const FIXES = new Set(['clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack']);
+const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose', 'inventory']);
+const FIXES = new Set(['clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack', 'enable_wol']);
 
 // Version fingerprint of the agent script this server is serving (normalised, ASCII). Agents report
 // the fingerprint of the script they are running, so the dashboard can show who still needs the update.
@@ -51,7 +51,10 @@ const AGENT_LABEL = labelFor(AGENT_VER);
 console.log(`[dash] agent version ${AGENT_LABEL} (fingerprint ${AGENT_VER})`);
 const UNINSTALL_ALIVE_MS = 20 * 1000;
 const UNINSTALL_WAIT_MS = 2 * 60 * 1000; // how long the dashboard shows "removing..." before giving up
-const COMMAND_TTL_MS = 60 * 1000; // a queued command the agent does not pick up in time is dropped
+const COMMAND_TTL_MS = 60 * 1000;
+const WAKE_WAIT_MS = 5 * 60 * 1000; // dashboard shows "waking..." this long after a Wake-on-LAN request
+const MAC_RE = /^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/;
+const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/; // a queued command the agent does not pick up in time is dropped
 const NUMBER_RE = /^[A-Za-z0-9_-]{1,32}$/;
 
 const computers = new Map(); // number -> { number, name, hostname, firstSeen, lastSeen, busy, pending }
@@ -70,8 +73,8 @@ function scheduleSave() {
     saveTimer = null;
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
-      const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen }) => (
-        { number, name, hostname, firstSeen, lastSeen }));
+      const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }) => (
+        { number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }));
       fs.writeFileSync(DATA_FILE, JSON.stringify(list));
     } catch (e) { console.error('[dash] save failed:', e.message); }
   }, 15000);
@@ -138,6 +141,43 @@ function cleanSysInfo(si) {
   };
 }
 
+// LAN identity list the agent reports with its stats: MAC + IPv4 + prefix + gateway of each active adapter.
+function cleanLan(arr) {
+  if (!Array.isArray(arr)) return null;
+  const out = [];
+  for (const x of arr.slice(0, 4)) {
+    if (!x || typeof x !== 'object') continue;
+    const mac = String(x.mac || '').toUpperCase();
+    if (!MAC_RE.test(mac) || mac === '00:00:00:00:00:00') continue;
+    const ip = IPV4_RE.test(String(x.ip || '')) ? String(x.ip) : '';
+    const prefix = Number.isInteger(x.prefix) && x.prefix >= 8 && x.prefix <= 30 ? x.prefix : 24;
+    out.push({ mac, ip, prefix, gw: IPV4_RE.test(String(x.gw || '')) ? String(x.gw) : '', wifi: !!x.wifi });
+  }
+  return out.length ? out : null;
+}
+
+// Hardware inventory (read-only snapshot from the agent): cap every string/array, never trust types.
+function cleanInventory(v) {
+  if (!v || typeof v !== 'object') return null;
+  const str = (x, n) => (typeof x === 'string' ? x.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n) : '');
+  const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? Math.round(x * 10) / 10 : null);
+  const arr = (a, n, f) => (Array.isArray(a) ? a.slice(0, n).filter((x) => x && typeof x === 'object').map(f) : []);
+  return {
+    manufacturer: str(v.manufacturer, 60), model: str(v.model, 80), serial: str(v.serial, 60),
+    biosVersion: str(v.biosVersion, 60), biosDate: str(v.biosDate, 12), boardMaker: str(v.boardMaker, 60), board: str(v.board, 60),
+    cpu: str(v.cpu, 100), cores: num(v.cores), threads: num(v.threads), maxMhz: num(v.maxMhz),
+    ramGb: v.ramBytes ? Math.round(Number(v.ramBytes) / 1073741824 * 10) / 10 : null,
+    ramModules: arr(v.ramModules, 8, (m) => ({ gb: num(m.gb), mhz: num(m.mhz), maker: str(m.maker, 30), part: str(m.part, 30), slot: str(m.slot, 20) })),
+    disks: arr(v.disks, 8, (d) => ({ model: str(d.model, 70), gb: num(d.gb), type: str(d.type, 20), bus: str(d.bus, 20) })),
+    volumes: arr(v.volumes, 10, (d) => ({ id: str(d.id, 4), label: str(d.label, 30), fs: str(d.fs, 10), totalGb: num(d.totalGb), freeGb: num(d.freeGb) })),
+    gpus: arr(v.gpus, 4, (g) => ({ name: str(g.name, 80), driver: str(g.driver, 30), mb: num(g.mb) })),
+    os: str(v.os, 80), osVersion: str(v.osVersion, 30), osBuild: str(v.osBuild, 12), osArch: str(v.osArch, 20),
+    osInstall: str(v.osInstall, 12), lastBoot: str(v.lastBoot, 20), timeZone: str(v.timeZone, 50),
+    domain: str(v.domain, 60), partOfDomain: !!v.partOfDomain,
+    nics: arr(v.nics, 8, (n) => ({ name: str(n.name, 40), desc: str(n.desc, 80), mac: str(n.mac, 20).toUpperCase(), status: str(n.status, 16), mbps: num(n.mbps), wifi: !!n.wifi, ip: str(n.ip, 45), wol: str(n.wol, 12) })),
+  };
+}
+
 function cleanStats(s) {
   if (!s || typeof s !== 'object') return null;
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -146,7 +186,7 @@ function cleanStats(s) {
     os: str(s.os, 80), user: str(s.user, 80), ip: str(s.ip, 45), agent: str(s.agent, 10), ver: str(s.ver, 16),
     cpuPct: num(s.cpuPct), ramTotalGb: num(s.ramTotalGb), ramFreeGb: num(s.ramFreeGb),
     diskTotalGb: num(s.diskTotalGb), diskFreeGb: num(s.diskFreeGb), uptimeHours: num(s.uptimeHours),
-    vnc: !!s.vnc,
+    vnc: !!s.vnc, lan: cleanLan(s.lan),
   };
 }
 
@@ -187,6 +227,14 @@ function cleanNetInfo(n) {
   };
 }
 
+// ---- Wake-on-LAN helpers ----
+const ipInt = (ip) => ip.split('.').reduce((a, o) => ((a << 8) | (Number(o) & 255)) >>> 0, 0);
+const maskInt = (pl) => (pl <= 0 ? 0 : (0xFFFFFFFF << (32 - pl)) >>> 0);
+const sameNet = (a, b) => !!(a.ip && b.ip && a.prefix === b.prefix && ((ipInt(a.ip) & maskInt(a.prefix)) >>> 0) === ((ipInt(b.ip) & maskInt(b.prefix)) >>> 0));
+const bcastOf = (x) => { if (!x.ip) return ''; const b = ((ipInt(x.ip) | (~maskInt(x.prefix) >>> 0)) >>> 0); return [b >>> 24, (b >>> 16) & 255, (b >>> 8) & 255, b & 255].join('.'); };
+// wired adapters first (Wi-Fi rarely supports waking from a powered-off state)
+const wakeMacs = (c) => (c.lan || []).slice().sort((a, b) => Number(a.wifi) - Number(b.wifi));
+
 const isOnline = (c) => !!c.lastSeen && Date.now() - c.lastSeen < ONLINE_MS;
 // online | unstable (missed heartbeats for under 5 minutes: usually a network blip) | offline
 const connState = (c) => (isOnline(c) ? 'online' : c.lastSeen && Date.now() - c.lastSeen < DOWN_MS ? 'unstable' : 'offline');
@@ -202,6 +250,9 @@ const view = (c) => ({
   uninstallFailed: !!c.uninstallAt && !!c.lastSeen && c.lastSeen > c.uninstallAt + UNINSTALL_ALIVE_MS,
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
   stats: c.stats || null,
+  canWake: !isOnline(c) && wakeMacs(c).length > 0, lan: c.lan || null,
+  waking: !isOnline(c) && !!c.wakeAt && Date.now() - c.wakeAt < WAKE_WAIT_MS, wakeAt: c.wakeAt || null,
+  inventory: c.inventory || null, inventoryAt: c.inventoryAt || null,
   sysinfo: c.sysinfo || null, sysinfoAt: c.sysinfoAt || null,
   killResult: c.killResult || null, killResultAt: c.killResultAt || null,
   rttMs: c.rttMs != null ? c.rttMs : null, netinfo: c.netinfo || null, netinfoAt: c.netinfoAt || null,
@@ -271,7 +322,7 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   if (!COMMANDS.has(action)) return res.status(400).json({ error: 'unknown action' });
   // These need the current agent script: older versions run heavy work inline and can freeze the whole agent
   // (computer then shows as not connected) on slow or broken-WMI computers, or do not know the command at all.
-  if (['sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose'].includes(action) && !isCurrent(c)) {
+  if (['sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose', 'inventory'].includes(action) && !isCurrent(c)) {
     return res.status(409).json({ error: 'agent_outdated' });
   }
   if (action === 'uninstall') {
@@ -281,7 +332,7 @@ router.post('/computers/:number/command', requireAuth, (req, res) => {
   }
   c.commands = (c.commands || []).slice(-4);
   c.commands.push({ action, at: Date.now() });
-  if (!['sysinfo', 'nettest', 'getlog', 'diagnose'].includes(action)) addEvent(c.number, 'cmd', 'פקודה: ' + action);
+  if (!['sysinfo', 'nettest', 'getlog', 'diagnose', 'inventory'].includes(action)) addEvent(c.number, 'cmd', 'פקודה: ' + action);
   console.log(`[dash] command ${action} queued for computer ${c.number}`);
   res.json({ ok: true });
 });
@@ -321,6 +372,30 @@ router.get('/computers/:number/diag', requireAuth, (req, res) => {
   const c = computers.get(req.params.number);
   if (!c) return res.status(404).json({ error: 'unknown computer' });
   res.json({ diag: c.diag || null, diagAt: c.diagAt || null, fixResults: c.fixResults || [] });
+});
+
+// Wake a powered-off computer (Wake-on-LAN). The server cannot reach the LAN itself, so it asks up to two ONLINE
+// agents on the same network (same subnet, else same public IP) to broadcast the magic packet.
+router.post('/computers/:number/wake', requireAuth, (req, res) => {
+  const t = computers.get(req.params.number);
+  if (!t) return res.status(404).json({ error: 'unknown computer' });
+  if (isOnline(t)) return res.status(409).json({ error: 'already_online' });
+  const macs = wakeMacs(t);
+  if (!macs.length) return res.status(409).json({ error: 'no_mac' });
+  const now = Date.now();
+  const cands = [...computers.values()].filter((x) => x !== t && isOnline(x) && !x.busy && x.stats && Number(x.stats.agent) >= 5);
+  const sameLan = cands.filter((x) => (x.lan || []).some((a) => macs.some((m) => sameNet(a, m))));
+  const samePub = cands.filter((x) => !sameLan.includes(x) && x.pubIp && t.pubIp && x.pubIp === t.pubIp);
+  const relays = sameLan.concat(samePub).sort((a, b) => b.lastSeen - a.lastSeen).slice(0, 2);
+  if (!relays.length) return res.status(409).json({ error: 'no_relay' });
+  for (const r of relays) {
+    r.wakes = (r.wakes || []).slice(-6);
+    for (const m of macs.slice(0, 2)) r.wakes.push({ number: t.number, mac: m.mac, bcast: bcastOf(m), at: now });
+  }
+  t.wakeAt = now;
+  addEvent(t.number, 'cmd', `הדלקה מרחוק (Wake-on-LAN) נשלחה דרך מחשב ${relays.map((r) => r.number).join(', ')}`);
+  console.log(`[dash] wake-on-lan for ${t.number} relayed by ${relays.map((r) => r.number).join(',')}`);
+  res.json({ ok: true, via: relays.map((r) => r.number) });
 });
 
 // End one process on a computer (from the "פרטי מחשב" window). The agent re-checks
@@ -387,7 +462,19 @@ router.post('/agent/heartbeat', (req, res) => {
   c.liveSinceBoot = true;   // seen alive since this server started (used so permanently-dead computers do not re-alert after every deploy)
   c.busy = !!body.busy;
   const st = cleanStats(body.stats);
-  if (st) c.stats = st;
+  if (st) {
+    c.stats = st;
+    if (st.lan) c.lan = st.lan;    // remembered while the computer is off, so it can be woken
+  }
+  c.pubIp = String(req.ip || '').slice(0, 64);
+  const inv = cleanInventory(body.inventory);
+  if (inv) { c.inventory = inv; c.inventoryAt = now; scheduleSave(); }
+  if (Array.isArray(body.wakeResults)) {
+    for (const w of body.wakeResults.slice(0, 4)) {
+      if (!w || typeof w !== 'object' || !NUMBER_RE.test(String(w.number || ''))) continue;
+      addEvent(String(w.number), 'info', `Wake-on-LAN דרך מחשב ${c.number}: ${w.ok ? 'החבילה נשלחה' : 'השליחה נכשלה'}${w.msg ? ' (' + String(w.msg).slice(0, 80) + ')' : ''}`);
+    }
+  }
   // Only present when the agent just answered a "sysinfo" command (see
   // Get-SysInfo in sionyx-agent.ps1) - most heartbeats won't carry this.
   const si = cleanSysInfo(body.sysinfo);
@@ -440,8 +527,10 @@ router.post('/agent/heartbeat', (req, res) => {
   c.kills = [];
   const fixes = (c.fixes || []).filter((x) => now2 - x.at < COMMAND_TTL_MS).map((x) => x.id);
   c.fixes = [];
+  const wake = (c.wakes || []).filter((x) => now2 - x.at < COMMAND_TTL_MS).map((x) => ({ number: x.number, mac: x.mac, bcast: x.bcast }));
+  c.wakes = [];
   scheduleSave();
-  res.json({ session, commands, kills, fixes });
+  res.json({ session, commands, kills, fixes, wake });
 });
 
 // The agent calls this right before it deletes itself from the computer: the computer is
@@ -520,7 +609,7 @@ function scheduleHistSave() { if (histTimer) return; histTimer = setTimeout(() =
 function kvSaveComputers() {
   if (!kvOn() || Date.now() - kvCompAt < 2 * 60 * 1000) return;
   kvCompAt = Date.now();
-  const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen }) => ({ number, name, hostname, firstSeen, lastSeen }));
+  const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }) => ({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }));
   kvSet('sionyx:computers', list).catch((e) => console.error('[dash] kv computers:', e.message));
 }
 function loadHistFile() {
