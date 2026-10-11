@@ -724,15 +724,17 @@ function wolInfo(c) {
   const v = c.inventory;
   const out = (cls, text, win, bios) => ({ cls, text, win, bios });
   const nics = v ? (v.nics || []).filter((n) => !n.wifi) : [];
-  const winKnown = nics.some((n) => n.wol);
+  const unsupported = nics.length > 0 && nics.every((n) => !n.wol || n.wol === 'Unsupported') && nics.some((n) => n.wol === 'Unsupported');
+  const winKnown = nics.some((n) => n.wol && n.wol !== 'Unsupported');
   const winOn = nics.some((n) => n.wol === 'Enabled' && !/disab/i.test(n.s5 || ''));
   const b = v && v.biosWol ? v.biosWol : null;
-  const winTxt = !v ? 'לא ידוע' : winOn ? 'מופעל' : winKnown ? 'כבוי' : 'לא ידוע';
+  const winTxt = !v ? 'לא ידוע' : winOn ? 'מופעל' : winKnown ? 'כבוי' : unsupported ? 'הדרייבר לא מדווח על תמיכה' : 'לא ידוע';
   const biosTxt = !b ? 'לא ניתן לזיהוי' : b.state === 'disabled' ? 'כבוי (' + b.value + ')' : b.state === 'enabled' ? 'מופעל (' + b.value + ')' : 'לא ידוע';
   if (c.wakeOkAt) return out('ok', 'עובד (אומת בפועל)', winTxt, biosTxt);
   if (!v) return out('unk', 'לא ידוע', winTxt, biosTxt);
   if (!nics.length) return out('bad', 'אין כרטיס רשת קווי', winTxt, biosTxt);
   if (b && b.state === 'disabled') return out('bad', 'כבוי ב-BIOS', winTxt, biosTxt);
+  if (unsupported) return out('warn', 'הדרייבר לא מדווח על תמיכה - כדאי לנסות הדלקה או לעדכן דרייבר', winTxt, biosTxt);
   if (winKnown && !winOn) return out('warn', 'כבוי ב-Windows (אפשר להפעיל מהדשבורד)', winTxt, biosTxt);
   if (winOn && b && b.state === 'enabled') return out('ok', 'מוכן (BIOS + Windows)', winTxt, biosTxt);
   if (winOn) return out('warn', 'Windows מוכן, BIOS לא ניתן לזיהוי - כדאי לנסות הדלקה', winTxt, biosTxt);
@@ -799,11 +801,11 @@ function renderInventory(c) {
       + tbl(['דיסק', 'גודל', 'סוג'], (v.disks || []).map((d) => [d.model, fmtGb(d.gb), [d.type, d.bus].filter(Boolean).join(' / ')]), 'אין נתונים')
       + tbl(['כונן', 'שם', 'מערכת קבצים', 'גודל', 'פנוי'], (v.volumes || []).map((d) => [d.id, d.label, d.fs, fmtGb(d.totalGb), fmtGb(d.freeGb)]), 'אין נתונים')
       + sec('כרטיס מסך')
-      + tbl(['כרטיס', 'זיכרון', 'דרייבר'], (v.gpus || []).map((g) => [g.name, g.mb ? fmtGb(g.mb) : '', g.driver]), 'אין נתונים')
+      + tbl(['כרטיס', 'זיכרון', 'דרייבר'], (v.gpus || []).map((g) => [g.name, g.mb ? (g.mb >= 1024 ? (g.mb / 1024).toFixed(1) + ' GB' : g.mb + ' MB') : '', g.driver]), 'אין נתונים')
       + sec('מערכת הפעלה')
       + `<div class="sysGrid">${kv('מערכת', v.os)}${kv('גרסה', [v.osVersion, v.osBuild ? 'build ' + v.osBuild : '', v.osArch].filter(Boolean).join(' · '))}${kv('הותקנה', v.osInstall)}${kv('אתחול אחרון', v.lastBoot)}${kv('אזור זמן', v.timeZone)}</div>`
       + sec('כרטיסי רשת')
-      + tbl(['כרטיס', 'MAC', 'IP', 'מהירות', 'Wake-on-LAN'], (v.nics || []).map((n) => [n.name + (n.wifi ? ' (Wi-Fi)' : '') + (n.status && n.status !== 'Up' ? ' - ' + n.status : ''), n.mac, n.ip, n.mbps ? n.mbps + ' Mbps' : '', WOL_TXT[n.wol] || n.wol]), 'אין נתונים');
+      + tbl(['כרטיס', 'MAC', 'IP', 'מהירות', 'Wake-on-LAN'], (v.nics || []).map((n) => [(n.desc || n.name) + (n.wifi ? ' (Wi-Fi)' : '') + (n.status && n.status !== 'Up' ? ' - ' + n.status : ''), n.mac, n.ip, n.mbps ? n.mbps + ' Mbps' : '', WOL_TXT[n.wol] || n.wol]), 'אין נתונים');
   }
   const w = $('invWake'); if (w) w.onclick = () => wakeComputer(c, w);
   const rf = $('invRefresh'); if (rf) rf.onclick = () => requestInventory(c, rf);

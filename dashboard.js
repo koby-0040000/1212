@@ -167,7 +167,7 @@ function cleanBiosWol(b) {
 // Hardware inventory (read-only snapshot from the agent): cap every string/array, never trust types.
 function cleanInventory(v) {
   if (!v || typeof v !== 'object') return null;
-  const str = (x, n) => (typeof x === 'string' ? x.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n) : '');
+  const str = (x, n) => (typeof x === 'string' ? x.replace(/[\u0000-\u001f]/g, ' ').replace(/^\?+/, '').trim().slice(0, n) : '');
   const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? Math.round(x * 10) / 10 : null);
   const arr = (a, n, f) => (Array.isArray(a) ? a.slice(0, n).filter((x) => x && typeof x === 'object').map(f) : []);
   return {
