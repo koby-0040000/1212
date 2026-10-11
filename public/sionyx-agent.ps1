@@ -253,9 +253,22 @@ function Get-Inventory {
     $inv.cpu = ([string]$cpu.Name).Trim(); $inv.cores = [int]$cpu.NumberOfCores; $inv.threads = [int]$cpu.NumberOfLogicalProcessors; $inv.maxMhz = [int]$cpu.MaxClockSpeed
   } catch { }
   try {
+    # memory generation: SMBIOSMemoryType uses the SMBIOS numbering, the older MemoryType the legacy one
+    $smb = @{ 18 = 'DDR'; 19 = 'DDR2'; 20 = 'DDR2 FB-DIMM'; 24 = 'DDR3'; 26 = 'DDR4'; 27 = 'LPDDR'; 28 = 'LPDDR2'; 29 = 'LPDDR3'; 30 = 'LPDDR4'; 34 = 'DDR5'; 35 = 'LPDDR5' }
+    $leg = @{ 20 = 'DDR'; 21 = 'DDR2'; 22 = 'DDR2 FB-DIMM'; 24 = 'DDR3' }
+    $ffm = @{ 8 = 'DIMM'; 12 = 'SO-DIMM' }
     $inv.ramModules = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | ForEach-Object {
-      @{ gb = [math]::Round([double]$_.Capacity / 1GB, 1); mhz = [int]$_.Speed; maker = ([string]$_.Manufacturer).Trim(); part = ([string]$_.PartNumber).Trim(); slot = [string]$_.DeviceLocator }
+      $ty = ''
+      if ($smb.ContainsKey([int]$_.SMBIOSMemoryType)) { $ty = $smb[[int]$_.SMBIOSMemoryType] } elseif ($leg.ContainsKey([int]$_.MemoryType)) { $ty = $leg[[int]$_.MemoryType] }
+      $fo = ''; if ($ffm.ContainsKey([int]$_.FormFactor)) { $fo = $ffm[[int]$_.FormFactor] }
+      @{ gb = [math]::Round([double]$_.Capacity / 1GB, 1); mhz = [int]$_.Speed; maker = ([string]$_.Manufacturer).Trim(); part = ([string]$_.PartNumber).Trim(); slot = [string]$_.DeviceLocator; type = $ty; form = $fo }
     })
+  } catch { }
+  try {
+    $arr = Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction Stop | Select-Object -First 1
+    $inv.ramSlots = [int]$arr.MemoryDevices
+    $mx = [double]$arr.MaxCapacityEx; if ($mx -le 0) { $mx = [double]$arr.MaxCapacity }
+    if ($mx -gt 0) { $inv.ramMaxGb = [math]::Round($mx / 1048576, 0) }
   } catch { }
   try {
     $pd = @{}
@@ -778,7 +791,11 @@ function Set-BiosWol {
       $r.msg = if ($r.ok) { 'Lenovo: set ' + $name + ' ' + $cur + ' -> ' + $want + ' (may apply after restart)' } else { 'Lenovo: change not saved (' + [string]$o2.return + ')' }
     } elseif ($mk -match 'HP|Hewlett') {
       $x = @(Get-CimInstance -Namespace 'root\HP\InstrumentedBIOS' -ClassName HP_BIOSEnumeration -ErrorAction Stop | Where-Object { $_.Name -match 'Wake.?on.?LAN|WOL' }) | Select-Object -First 1
-      if (-not $x) { $r.msg = 'HP: no Wake-on-LAN setting exposed'; return $r }
+      if (-not $x) {
+        $cand = @(Get-CimInstance -Namespace 'root\HP\InstrumentedBIOS' -ClassName HP_BIOSSetting -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Wake|WOL|LAN|S5|Network|Remote' } | ForEach-Object { [string]$_.Name } | Select-Object -First 6)
+        $r.msg = 'HP: no Wake-on-LAN setting exposed' + $(if ($cand.Count -gt 0) { ' (related: ' + ($cand -join ', ') + ')' } else { ' (this model/BIOS does not list one)' })
+        return $r
+      }
       $cur = [string]$x.Value
       if ($cur -notmatch 'disab') { $r.ok = $true; $r.msg = 'HP: already enabled (' + $cur + ')'; return $r }
       $opts = @($x.PossibleValues)

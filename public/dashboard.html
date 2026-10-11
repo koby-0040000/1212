@@ -795,6 +795,14 @@ function openWolReport() {
 }
 $('wolRep').onclick = openWolReport;
 
+// memory generation as reported by the BIOS (DDR3 / DDR4 ...); a board only accepts one generation
+function ramTypeText(v) {
+  const types = [...new Set((v.ramModules || []).map((m) => m.type).filter(Boolean))];
+  if (!types.length) return 'לא דווח ע"י ה-BIOS';
+  const forms = [...new Set((v.ramModules || []).map((m) => m.form).filter(Boolean))];
+  return types.join(' / ') + (forms.length ? ' (' + forms.join(' / ') + ')' : '');
+}
+
 // ---------- hardware inventory + Wake-on-LAN ----------
 // The agent reports the hardware snapshot on start-up and once a day; the server keeps it (and the MAC
 // addresses) even while the computer is off, so this window also works for computers that are not connected.
@@ -834,8 +842,8 @@ function renderInventory(c) {
       + sec('מחשב')
       + `<div class="sysGrid">${kv('יצרן', v.manufacturer)}${kv('דגם', v.model)}${kv('מספר סידורי', v.serial)}${kv('BIOS', [v.biosVersion, v.biosDate].filter(Boolean).join(' · '))}${kv('לוח אם', [v.boardMaker, v.board].filter(Boolean).join(' '))}${kv('דומיין / קבוצת עבודה', (v.partOfDomain ? 'דומיין: ' : 'קבוצת עבודה: ') + (v.domain || ''))}</div>`
       + sec('מעבד וזיכרון')
-      + `<div class="sysGrid">${kv('מעבד', v.cpu)}${kv('ליבות / תהליכונים', (v.cores || '-') + ' / ' + (v.threads || '-') + (ghz ? ' · ' + ghz : ''))}${kv('זיכרון כולל', v.ramGb != null ? v.ramGb + ' GB' : '')}</div>`
-      + tbl(['חריץ', 'גודל', 'מהירות', 'יצרן / דגם'], (v.ramModules || []).map((m) => [m.slot, m.gb != null ? m.gb + ' GB' : '', m.mhz ? m.mhz + ' MHz' : '', [m.maker, m.part].filter(Boolean).join(' ')]), 'אין פירוט מודולים')
+      + `<div class="sysGrid">${kv('מעבד', v.cpu)}${kv('ליבות / תהליכונים', (v.cores || '-') + ' / ' + (v.threads || '-') + (ghz ? ' · ' + ghz : ''))}${kv('זיכרון כולל', v.ramGb != null ? v.ramGb + ' GB' : '')}${kv('סוג זיכרון', ramTypeText(v))}${kv('חריצי זיכרון', v.ramSlots ? (v.ramModules || []).length + ' תפוסים מתוך ' + v.ramSlots + (v.ramMaxGb ? ' · מקסימום ' + v.ramMaxGb + ' GB' : '') : '')}</div>`
+      + tbl(['חריץ', 'סוג', 'גודל', 'מהירות', 'יצרן / דגם'], (v.ramModules || []).map((m) => [m.slot, [m.type, m.form].filter(Boolean).join(' '), m.gb != null ? m.gb + ' GB' : '', m.mhz ? m.mhz + ' MHz' : '', [m.maker, m.part].filter(Boolean).join(' ')]), 'אין פירוט מודולים')
       + sec('דיסקים')
       + tbl(['דיסק', 'גודל', 'סוג'], (v.disks || []).map((d) => [d.model, fmtGb(d.gb), [d.type, d.bus].filter(Boolean).join(' / ')]), 'אין נתונים')
       + tbl(['כונן', 'שם', 'מערכת קבצים', 'גודל', 'פנוי'], (v.volumes || []).map((d) => [d.id, d.label, d.fs, fmtGb(d.totalGb), fmtGb(d.freeGb)]), 'אין נתונים')
@@ -932,10 +940,10 @@ $('wakeAll').onclick = async () => {
 // one row per computer, opens in Excel (UTF-8 BOM so Hebrew shows correctly)
 $('csvBtn').onclick = () => {
   const q = (x) => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"';
-  const head = ['מספר', 'שם', 'שם מחשב', 'מצב', 'יצרן', 'דגם', 'מספר סידורי', 'מעבד', 'ליבות', 'זיכרון GB', 'דיסקים', 'כרטיס מסך', 'מערכת הפעלה', 'כתובות MAC', 'IP', 'נאסף', 'הדלקה מרחוק'];
+  const head = ['מספר', 'שם', 'שם מחשב', 'מצב', 'יצרן', 'דגם', 'מספר סידורי', 'מעבד', 'ליבות', 'זיכרון GB', 'סוג זיכרון', 'דיסקים', 'כרטיס מסך', 'מערכת הפעלה', 'כתובות MAC', 'IP', 'נאסף', 'הדלקה מרחוק'];
   const rows = [...data].sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true })).map((c) => {
     const v = c.inventory || {};
-    return [c.number, c.name, c.hostname, c.online ? 'פעיל' : 'לא מחובר', v.manufacturer, v.model, v.serial, v.cpu, v.cores, v.ramGb,
+    return [c.number, c.name, c.hostname, c.online ? 'פעיל' : 'לא מחובר', v.manufacturer, v.model, v.serial, v.cpu, v.cores, v.ramGb, v.ramModules ? ramTypeText(v) : '',
       (v.disks || []).map((d) => `${d.model} ${d.gb}GB`).join(' + '), (v.gpus || []).map((g) => g.name).join(' + '), v.os,
       (c.lan || []).map((x) => x.mac).join(' '), (c.lan || []).map((x) => x.ip).join(' '), c.inventoryAt ? new Date(c.inventoryAt).toLocaleString('he-IL') : '', wolInfo(c).text];
   });
