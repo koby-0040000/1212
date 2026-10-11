@@ -282,14 +282,33 @@ function Get-Inventory {
     if ($os.LastBootUpTime) { $inv.lastBoot = $os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm') }
   } catch { }
   try { $inv.timeZone = [string](Get-TimeZone).Id } catch { }
+  # BIOS "Wake on LAN" setting: Windows has no generic way to read it, but Dell / Lenovo / HP expose it through WMI.
+  # Other makers (or virtual machines) simply report nothing and the dashboard shows "unknown".
+  try {
+    $bw = $null
+    $mk = [string]$inv.manufacturer
+    if ($mk -match 'Dell') {
+      $x = @(Get-CimInstance -Namespace 'root\dcim\sysman' -ClassName DCIM_BIOSEnumeration -ErrorAction Stop | Where-Object { $_.AttributeName -match 'Wake.?on.?LAN' }) | Select-Object -First 1
+      if ($x) { $bw = @{ src = 'Dell'; name = [string]$x.AttributeName; value = (@($x.CurrentValue) -join ',') } }
+    } elseif ($mk -match 'LENOVO') {
+      $x = @(Get-CimInstance -Namespace 'root\wmi' -ClassName Lenovo_BiosSetting -ErrorAction Stop | Where-Object { $_.CurrentSetting -match '^Wake.?on.?LAN' }) | Select-Object -First 1
+      if ($x) { $parts = ([string]$x.CurrentSetting).Split(',;'.ToCharArray()); $bw = @{ src = 'Lenovo'; name = [string]$parts[0]; value = [string]$parts[1] } }
+    } elseif ($mk -match 'HP|Hewlett') {
+      $x = @(Get-CimInstance -Namespace 'root\HP\InstrumentedBIOS' -ClassName HP_BIOSEnumeration -ErrorAction Stop | Where-Object { $_.Name -match 'Wake.?on.?LAN|WOL' }) | Select-Object -First 1
+      if ($x) { $bw = @{ src = 'HP'; name = [string]$x.Name; value = [string]$x.Value } }
+    }
+    if ($bw) { $inv.biosWol = $bw }
+  } catch { }
   try {
     $nics = @()
     foreach ($a in @(Get-NetAdapter -Physical -ErrorAction Stop)) {
       $wol = ''
       try { $pm = Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction Stop; $wol = [string]$pm.WakeOnMagicPacket } catch { }
+      $s5 = ''
+      try { $ap = @(Get-NetAdapterAdvancedProperty -Name $a.Name -ErrorAction Stop | Where-Object { $_.DisplayName -match 'Shutdown Wake|Wake.*(power off|shutdown)|Wake on Magic Packet from' }) | Select-Object -First 1; if ($ap) { $s5 = [string]$ap.DisplayValue } } catch { }
       $ipv4 = ''
       try { $ipv4 = [string](Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1).IPAddress } catch { }
-      $nics += @{ name = [string]$a.Name; desc = [string]$a.InterfaceDescription; mac = ([string]$a.MacAddress).Replace('-', ':'); status = [string]$a.Status; mbps = [math]::Round([double]$a.Speed / 1e6); wifi = [bool]($a.PhysicalMediaType -like '*802.11*'); ip = $ipv4; wol = $wol }
+      $nics += @{ name = [string]$a.Name; desc = [string]$a.InterfaceDescription; mac = ([string]$a.MacAddress).Replace('-', ':'); status = [string]$a.Status; mbps = [math]::Round([double]$a.Speed / 1e6); wifi = [bool]($a.PhysicalMediaType -like '*802.11*'); ip = $ipv4; wol = $wol; s5 = $s5 }
     }
     $inv.nics = @($nics)
   } catch { }
@@ -766,6 +785,11 @@ function Invoke-Fix([string]$id) {
           try {
             $pr = Get-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*WakeOnMagicPacket' -ErrorAction Stop
             if ($pr) { Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*WakeOnMagicPacket' -RegistryValue 1 -ErrorAction Stop }
+          } catch { }
+          try {
+            foreach ($ap in @(Get-NetAdapterAdvancedProperty -Name $a.Name -ErrorAction Stop | Where-Object { $_.DisplayName -match 'Shutdown Wake|Wake.*(power off|shutdown)|Wake on Magic Packet from' })) {
+              if ([string]$ap.DisplayValue -match 'Disab') { Set-NetAdapterAdvancedProperty -Name $a.Name -DisplayName $ap.DisplayName -DisplayValue 'Enabled' -ErrorAction Stop }
+            }
           } catch { }
           try { & powercfg.exe /deviceenablewake $a.InterfaceDescription 2>&1 | Out-Null } catch { }
           $n++

@@ -195,6 +195,7 @@
     <button class="f" data-f="off">לא מחוברים</button>
     <button class="f" data-f="hot">עומס גבוה</button>
     <button class="f" data-f="stale">לא מעודכנים</button>
+    <button class="f" id="wolRep" type="button" title="איזה מחשבים מוכנים להדלקה מרחוק, ואיזה מהם כבוי ב-BIOS או ב-Windows">&#9211; מוכנות הדלקה</button>
     <button class="f" id="wakeAll" type="button" title="שלח Wake-on-LAN לכל המחשבים הכבויים שידועה להם כתובת רשת">&#9211; הדלק את כל הכבויים</button>
     <button class="f" id="selAll" title="סמן את כל המחשבים המחוברים (לפי הסינון)">&#9745; בחר מחוברים</button>
     <div id="bulk">
@@ -292,9 +293,10 @@ function makeCard(c) {
   const rep_ = el('button', 'small half', '\u{1FA7A} בדוק ותקן'); rep_.title = 'סורק את המחשב לבעיות נפוצות (איטיות, דיסק מלא, שירותים כבויים, שעון...) ומציע תיקונים';
   const inv = el('button', 'small wide', '\u{1F9FE} מפרט חומרה'); inv.title = 'יצרן, דגם, מספר סידורי, מעבד, זיכרון, דיסקים, כרטיס מסך, כרטיסי רשת וכתובות MAC';
   row.append(go, cmd, sys, rep_, inv);
-  card.append(top, sub, seen, note, gauges, tags, row);
+  const wolRow = el('div', 'tags'), wolTag = el('span', 'tag'); wolRow.append(wolTag);
+  card.append(top, sub, seen, note, wolRow, gauges, tags, row);
   card.addEventListener('animationend', () => card.classList.remove('enter'), { once: true });
-  const entry = { el: card, c, refs: { numTxt, sel, badge, badgeTxt, sub, seen, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, sys, rep: rep_, inv } };
+  const entry = { el: card, c, refs: { numTxt, sel, badge, badgeTxt, sub, seen, wolTag, note, gauges, gCpu, gRam, gDisk, tags, go, cmd, sys, rep: rep_, inv } };
   go.onclick = () => { const x = entry.c; if (!x.online && x.connState !== 'unstable' && x.canWake) wakeComputer(x, go); else connect(x, go); };
   inv.onclick = () => openInventory(entry.c);
   numTxt.onclick = () => rename(entry.c);
@@ -317,6 +319,10 @@ function paint(entry, c) {
   r.badgeTxt.textContent = { removing: 'מסיר...', failed: 'ההסרה נכשלה', busy: 'בשליטה', online: 'פעיל', unstable: 'מתחבר מחדש...', off: 'לא מחובר' }[state];
   r.sub.textContent = [c.name, c.hostname].filter(Boolean).join(' · ') || '\u00a0';
   r.seen.textContent = c.online ? '\u00a0' : 'נראה לאחרונה: ' + ago(c.lastSeen);
+  const wi = wolInfo(c);
+  r.wolTag.textContent = '\u23FB הדלקה מרחוק: ' + wi.text;
+  r.wolTag.className = 'tag' + (wi.cls === 'ok' ? ' ok' : wi.cls === 'unk' ? '' : ' warn');
+  r.wolTag.title = 'Windows: ' + wi.win + ' · BIOS: ' + wi.bios;
   r.note.style.display = state === 'failed' ? '' : 'none';
   r.note.textContent = 'המחשב ממשיך להגיב, ולכן התוכנה לא הוסרה. ייתכן שהקובץ ממתין לאישור בסינון, או שהסוכן ישן. אפשר לנסות שוב.';
   r.tags.textContent = '';
@@ -710,6 +716,45 @@ async function forget(c) {
   refresh();
 }
 
+// ---------- Wake-on-LAN readiness ----------
+// Windows cannot read the BIOS setting in general: it is read from the vendor's WMI where available (Dell / Lenovo / HP).
+// Otherwise the BIOS state is "unknown" and the only proof is a real wake: a computer that came back after a
+// Wake-on-LAN request is marked verified (c.wakeOkAt).
+function wolInfo(c) {
+  const v = c.inventory;
+  const out = (cls, text, win, bios) => ({ cls, text, win, bios });
+  const nics = v ? (v.nics || []).filter((n) => !n.wifi) : [];
+  const winKnown = nics.some((n) => n.wol);
+  const winOn = nics.some((n) => n.wol === 'Enabled' && !/disab/i.test(n.s5 || ''));
+  const b = v && v.biosWol ? v.biosWol : null;
+  const winTxt = !v ? 'לא ידוע' : winOn ? 'מופעל' : winKnown ? 'כבוי' : 'לא ידוע';
+  const biosTxt = !b ? 'לא ניתן לזיהוי' : b.state === 'disabled' ? 'כבוי (' + b.value + ')' : b.state === 'enabled' ? 'מופעל (' + b.value + ')' : 'לא ידוע';
+  if (c.wakeOkAt) return out('ok', 'עובד (אומת בפועל)', winTxt, biosTxt);
+  if (!v) return out('unk', 'לא ידוע', winTxt, biosTxt);
+  if (!nics.length) return out('bad', 'אין כרטיס רשת קווי', winTxt, biosTxt);
+  if (b && b.state === 'disabled') return out('bad', 'כבוי ב-BIOS', winTxt, biosTxt);
+  if (winKnown && !winOn) return out('warn', 'כבוי ב-Windows (אפשר להפעיל מהדשבורד)', winTxt, biosTxt);
+  if (winOn && b && b.state === 'enabled') return out('ok', 'מוכן (BIOS + Windows)', winTxt, biosTxt);
+  if (winOn) return out('warn', 'Windows מוכן, BIOS לא ניתן לזיהוי - כדאי לנסות הדלקה', winTxt, biosTxt);
+  return out('unk', 'לא ידוע', winTxt, biosTxt);
+}
+
+function openWolReport() {
+  stopSysLoad(); sysWatch = null; repairWatch = null; invWatch = null;
+  $('sysModal').classList.remove('hidden');
+  $('sysTitle').textContent = '\u23FB מוכנות הדלקה מרחוק';
+  const ORDER = { bad: 0, warn: 1, unk: 2, ok: 3 };
+  const rows = [...data].map((c) => ({ c, w: wolInfo(c) }))
+    .sort((a, b) => ORDER[a.w.cls] - ORDER[b.w.cls] || a.c.number.localeCompare(b.c.number, undefined, { numeric: true }));
+  const cnt = (k) => rows.filter((r) => r.w.cls === k).length;
+  const ICON = { ok: '\u2705', warn: '\u26A0\uFE0F', bad: '\u274C', unk: '\u2754' };
+  const tr = rows.map(({ c, w }) => `<tr><td><b>${esc(c.number)}</b>${c.name ? `<span class="procHint">${esc(c.name)}</span>` : ''}</td><td>${c.online ? 'דלוק' : 'כבוי'}</td><td>${ICON[w.cls]} ${esc(w.text)}</td><td>${esc(w.win)}</td><td>${esc(w.bios)}</td></tr>`).join('');
+  $('sysBody').innerHTML = `<div class="sysInsight ${cnt('ok') === rows.length && rows.length ? 'ok' : ''}">${ICON.ok} ${cnt('ok')} מוכנים · ${ICON.warn} ${cnt('warn')} דורשים בדיקה · ${ICON.bad} ${cnt('bad')} לא יעבדו · ${ICON.unk} ${cnt('unk')} לא ידוע</div>
+    <table class="sysTbl"><tr><th>מחשב</th><th>מצב</th><th>הדלקה מרחוק</th><th>Windows</th><th>BIOS</th></tr>${tr || '<tr><td colspan="5" style="color:var(--muted)">אין מחשבים</td></tr>'}</table>
+    <div class="sysSub2" style="margin-top:12px;line-height:1.6">ה-BIOS נקרא ישירות רק במחשבי Dell, Lenovo ו-HP. בשאר, כשכתוב "לא ניתן לזיהוי", ההוכחה היחידה היא הדלקה בפועל: מחשב שנדלק אחרי בקשת הדלקה מסומן "אומת". "כבוי ב-Windows" אפשר להפעיל מרחוק מחלון "מפרט חומרה" של המחשב. כבוי ב-BIOS צריך להפעיל ידנית במחשב עצמו.</div>`;
+}
+$('wolRep').onclick = openWolReport;
+
 // ---------- hardware inventory + Wake-on-LAN ----------
 // The agent reports the hardware snapshot on start-up and once a day; the server keeps it (and the MAC
 // addresses) even while the computer is off, so this window also works for computers that are not connected.
@@ -736,6 +781,7 @@ function renderInventory(c) {
   const refBtn = c.online ? '<button id="invRefresh" class="small" type="button">\u{1F504} רענן מהמחשב</button> <button id="invWol" class="small" type="button" title="מפעיל wake on magic packet בכרטיס הרשת של המחשב (צריך גם להפעיל Wake on LAN ב-BIOS)">\u26A1 הפעל Wake-on-LAN בכרטיס הרשת</button>' : '';
   const head = `<div class="sysSub2">${v ? 'נאסף ' + ago(c.inventoryAt) : 'עדיין לא נאסף מפרט ממחשב זה.'}${c.online ? '' : ' · המחשב לא מחובר - מוצג המידע השמור'}</div>
     <div class="netHead"><span>כתובות רשת (MAC / IP)</span></div>${lan ? `<div class="sysSub2" style="direction:ltr;text-align:right">${lan}</div>` : '<div class="sysSub2">לא ידועה כתובת רשת. היא נקלטת כשהסוכן המעודכן מתחבר.</div>'}
+    <div class="sysInsight ${wolInfo(c).cls === 'ok' ? 'ok' : ''}">\u23FB <b>הדלקה מרחוק: ${esc(wolInfo(c).text)}</b><br>Windows: ${esc(wolInfo(c).win)} · BIOS: ${esc(wolInfo(c).bios)}</div>
     <div style="margin:0 0 12px">${wakeBtn}${refBtn}</div>`;
   if (!v) {
     body.innerHTML = head + (c.online ? '<div class="sysLoading">הסוכן אוסף את המפרט אוטומטית תוך כדקה מהעדכון, או לחץ \"רענן מהמחשב\".</div>' : '<div class="sysLoading">אין עדיין נתונים. הם יישמרו כשהמחשב יתחבר בגרסת הסוכן החדשה.</div>');
@@ -826,12 +872,12 @@ $('wakeAll').onclick = async () => {
 // one row per computer, opens in Excel (UTF-8 BOM so Hebrew shows correctly)
 $('csvBtn').onclick = () => {
   const q = (x) => '"' + String(x == null ? '' : x).replace(/"/g, '""') + '"';
-  const head = ['מספר', 'שם', 'שם מחשב', 'מצב', 'יצרן', 'דגם', 'מספר סידורי', 'מעבד', 'ליבות', 'זיכרון GB', 'דיסקים', 'כרטיס מסך', 'מערכת הפעלה', 'כתובות MAC', 'IP', 'נאסף'];
+  const head = ['מספר', 'שם', 'שם מחשב', 'מצב', 'יצרן', 'דגם', 'מספר סידורי', 'מעבד', 'ליבות', 'זיכרון GB', 'דיסקים', 'כרטיס מסך', 'מערכת הפעלה', 'כתובות MAC', 'IP', 'נאסף', 'הדלקה מרחוק'];
   const rows = [...data].sort((a, b) => a.number.localeCompare(b.number, undefined, { numeric: true })).map((c) => {
     const v = c.inventory || {};
     return [c.number, c.name, c.hostname, c.online ? 'פעיל' : 'לא מחובר', v.manufacturer, v.model, v.serial, v.cpu, v.cores, v.ramGb,
       (v.disks || []).map((d) => `${d.model} ${d.gb}GB`).join(' + '), (v.gpus || []).map((g) => g.name).join(' + '), v.os,
-      (c.lan || []).map((x) => x.mac).join(' '), (c.lan || []).map((x) => x.ip).join(' '), c.inventoryAt ? new Date(c.inventoryAt).toLocaleString('he-IL') : ''];
+      (c.lan || []).map((x) => x.mac).join(' '), (c.lan || []).map((x) => x.ip).join(' '), c.inventoryAt ? new Date(c.inventoryAt).toLocaleString('he-IL') : '', wolInfo(c).text];
   });
   const csv = '\uFEFF' + [head, ...rows].map((r) => r.map(q).join(',')).join('\r\n');
   const a = document.createElement('a');

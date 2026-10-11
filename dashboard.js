@@ -73,8 +73,8 @@ function scheduleSave() {
     saveTimer = null;
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
-      const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }) => (
-        { number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }));
+      const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }) => (
+        { number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }));
       fs.writeFileSync(DATA_FILE, JSON.stringify(list));
     } catch (e) { console.error('[dash] save failed:', e.message); }
   }, 15000);
@@ -156,6 +156,14 @@ function cleanLan(arr) {
   return out.length ? out : null;
 }
 
+// BIOS Wake-on-LAN setting as read from the vendor's WMI (Dell/Lenovo/HP only). state: enabled | disabled | '' (unknown)
+function cleanBiosWol(b) {
+  if (!b || typeof b !== 'object') return null;
+  const str = (x, n) => (typeof x === 'string' ? x.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n) : '');
+  const value = str(b.value, 40);
+  return { src: str(b.src, 10), name: str(b.name, 40), value, state: !value ? '' : /disab|^off$|^no$|^none$/i.test(value) ? 'disabled' : 'enabled' };
+}
+
 // Hardware inventory (read-only snapshot from the agent): cap every string/array, never trust types.
 function cleanInventory(v) {
   if (!v || typeof v !== 'object') return null;
@@ -174,7 +182,8 @@ function cleanInventory(v) {
     os: str(v.os, 80), osVersion: str(v.osVersion, 30), osBuild: str(v.osBuild, 12), osArch: str(v.osArch, 20),
     osInstall: str(v.osInstall, 12), lastBoot: str(v.lastBoot, 20), timeZone: str(v.timeZone, 50),
     domain: str(v.domain, 60), partOfDomain: !!v.partOfDomain,
-    nics: arr(v.nics, 8, (n) => ({ name: str(n.name, 40), desc: str(n.desc, 80), mac: str(n.mac, 20).toUpperCase(), status: str(n.status, 16), mbps: num(n.mbps), wifi: !!n.wifi, ip: str(n.ip, 45), wol: str(n.wol, 12) })),
+    nics: arr(v.nics, 8, (n) => ({ name: str(n.name, 40), desc: str(n.desc, 80), mac: str(n.mac, 20).toUpperCase(), status: str(n.status, 16), mbps: num(n.mbps), wifi: !!n.wifi, ip: str(n.ip, 45), wol: str(n.wol, 12), s5: str(n.s5, 20) })),
+    biosWol: cleanBiosWol(v.biosWol),
   };
 }
 
@@ -251,7 +260,7 @@ const view = (c) => ({
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
   stats: c.stats || null,
   canWake: !isOnline(c) && wakeMacs(c).length > 0, lan: c.lan || null,
-  waking: !isOnline(c) && !!c.wakeAt && Date.now() - c.wakeAt < WAKE_WAIT_MS, wakeAt: c.wakeAt || null,
+  waking: !isOnline(c) && !!c.wakeAt && Date.now() - c.wakeAt < WAKE_WAIT_MS, wakeAt: c.wakeAt || null, wakeOkAt: c.wakeOkAt || null,
   inventory: c.inventory || null, inventoryAt: c.inventoryAt || null,
   sysinfo: c.sysinfo || null, sysinfoAt: c.sysinfoAt || null,
   killResult: c.killResult || null, killResultAt: c.killResultAt || null,
@@ -458,6 +467,10 @@ router.post('/agent/heartbeat', (req, res) => {
     console.log(`[dash] new computer registered: ${number}`);
   }
   c.hostname = String(body.hostname || '').slice(0, 64);
+  if (c.wakeAt && now - c.wakeAt < WAKE_WAIT_MS && !isOnline(c)) {
+    c.wakeOkAt = now; c.wakeAt = null;
+    addEvent(c.number, 'up', 'המחשב נדלק אחרי בקשת Wake-on-LAN - ההדלקה מרחוק עובדת בו');
+  }
   c.lastSeen = now;
   c.liveSinceBoot = true;   // seen alive since this server started (used so permanently-dead computers do not re-alert after every deploy)
   c.busy = !!body.busy;
@@ -609,7 +622,7 @@ function scheduleHistSave() { if (histTimer) return; histTimer = setTimeout(() =
 function kvSaveComputers() {
   if (!kvOn() || Date.now() - kvCompAt < 2 * 60 * 1000) return;
   kvCompAt = Date.now();
-  const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }) => ({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt }));
+  const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }) => ({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }));
   kvSet('sionyx:computers', list).catch((e) => console.error('[dash] kv computers:', e.message));
 }
 function loadHistFile() {
