@@ -32,7 +32,9 @@ const PENDING_TTL_MS = 2 * 60 * 1000; // a connect request the agent must pick u
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'computers.json');
 const COMMANDS = new Set(['cad', 'lock', 'logoff', 'restart', 'shutdown', 'uninstall', 'sysinfo', 'nettest', 'getlog', 'restartfilter', 'diagnose', 'inventory']);
-const FIXES = new Set(['clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack', 'enable_wol']);
+const FIXES = new Set(['clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack', 'enable_wol', 'enable_bios_wol', 'relieve_load', 'free_memory']);
+const FIX_HE = { enable_wol: 'הפעלת Wake-on-LAN ב-Windows', enable_bios_wol: 'הפעלת Wake-on-LAN ב-BIOS', relieve_load: 'הקלת עומס', free_memory: 'שחרור זיכרון' };
+const fixName = (id) => FIX_HE[id] || id;
 
 // Version fingerprint of the agent script this server is serving (normalised, ASCII). Agents report
 // the fingerprint of the script they are running, so the dashboard can show who still needs the update.
@@ -73,8 +75,8 @@ function scheduleSave() {
     saveTimer = null;
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
-      const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }) => (
-        { number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }));
+      const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt, biosAttempt }) => (
+        { number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt, biosAttempt }));
       fs.writeFileSync(DATA_FILE, JSON.stringify(list));
     } catch (e) { console.error('[dash] save failed:', e.message); }
   }, 15000);
@@ -138,6 +140,10 @@ function cleanSysInfo(si) {
   return {
     cpuModel: str(si.cpuModel, 120), cores: num(si.cores), threads: num(si.threads), maxMhz: num(si.maxMhz),
     procCount: num(si.procCount), cpuPct: num(si.cpuPct), processes: procs,
+    groups: Array.isArray(si.groups) ? si.groups.slice(0, 6).map((g) => ({ name: str(g && g.name, 60), count: num(g && g.count), pct: num(g && g.pct), memMb: num(g && g.memMb) })).filter((g) => g.name) : [],
+    cpuBreak: si.cpuBreak && typeof si.cpuBreak === 'object' ? { user: num(si.cpuBreak.user), priv: num(si.cpuBreak.priv), dpc: num(si.cpuBreak.dpc), intr: num(si.cpuBreak.intr) } : null,
+    mem: si.mem && typeof si.mem === 'object' ? { availMb: num(si.mem.availMb), pagesSec: num(si.mem.pagesSec) } : null,
+    disk: si.disk && typeof si.disk === 'object' ? { pct: num(si.disk.pct), queue: num(si.disk.queue) } : null,
   };
 }
 
@@ -260,7 +266,7 @@ const view = (c) => ({
   lastSeen: c.lastSeen || null, firstSeen: c.firstSeen || null,
   stats: c.stats || null,
   canWake: !isOnline(c) && wakeMacs(c).length > 0, lan: c.lan || null,
-  waking: !isOnline(c) && !!c.wakeAt && Date.now() - c.wakeAt < WAKE_WAIT_MS, wakeAt: c.wakeAt || null, wakeOkAt: c.wakeOkAt || null,
+  waking: !isOnline(c) && !!c.wakeAt && Date.now() - c.wakeAt < WAKE_WAIT_MS, wakeAt: c.wakeAt || null, wakeOkAt: c.wakeOkAt || null, biosAttempt: c.biosAttempt || null, loadRelief: c.loadRelief || null, memFree: c.memFree || null,
   inventory: c.inventory || null, inventoryAt: c.inventoryAt || null,
   sysinfo: c.sysinfo || null, sysinfoAt: c.sysinfoAt || null,
   killResult: c.killResult || null, killResultAt: c.killResultAt || null,
@@ -374,7 +380,7 @@ router.post('/computers/:number/fix', requireAuth, (req, res) => {
   c.fixes = (c.fixes || []).slice(-6);
   uniq.forEach((id) => c.fixes.push({ id, at: Date.now() }));
   c.fixResults = (c.fixResults || []);
-  addEvent(c.number, 'cmd', 'תיקון מרחוק: ' + uniq.join(', '));
+  addEvent(c.number, 'cmd', 'תיקון מרחוק: ' + uniq.map(fixName).join(', '));
   res.json({ ok: true, ids: uniq });
 });
 router.get('/computers/:number/diag', requireAuth, (req, res) => {
@@ -518,8 +524,14 @@ router.post('/agent/heartbeat', (req, res) => {
   if (dg) { c.diag = dg; c.diagAt = now; }
   const fr = cleanFixResults(body.fixResults);
   if (fr.length) {
+    const ba = fr.filter((r) => r.id === 'enable_bios_wol').pop();
+    const lr = fr.filter((r) => r.id === 'relieve_load').pop();
+    const fm = fr.filter((r) => r.id === 'free_memory').pop();
+    if (fm) c.memFree = { at: now, ok: fm.ok, msg: fm.msg };
+    if (lr) c.loadRelief = { at: now, ok: lr.ok, msg: lr.msg };
+    if (ba) { c.biosAttempt = { at: now, ok: ba.ok, msg: ba.msg }; scheduleSave(); }
     c.fixResults = (c.fixResults || []).concat(fr.map((r) => ({ ...r, at: now }))).slice(-12); c.fixAt = now;
-    fr.forEach((r) => addEvent(c.number, 'info', `תיקון ${r.id}: ${r.ok ? 'הצליח' : 'נכשל'}${r.msg ? ' (' + r.msg + ')' : ''}`));
+    fr.forEach((r) => addEvent(c.number, 'info', `תיקון ${fixName(r.id)}: ${r.ok ? 'הצליח' : 'נכשל'}${r.msg ? ' (' + r.msg + ')' : ''}`));
   }
   if (typeof body.logTail === 'string') { c.logTail = body.logTail.slice(-8000); c.logAt = now; }
   const kr = body.killResult;
@@ -622,7 +634,7 @@ function scheduleHistSave() { if (histTimer) return; histTimer = setTimeout(() =
 function kvSaveComputers() {
   if (!kvOn() || Date.now() - kvCompAt < 2 * 60 * 1000) return;
   kvCompAt = Date.now();
-  const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }) => ({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt }));
+  const list = [...computers.values()].map(({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt, biosAttempt }) => ({ number, name, hostname, firstSeen, lastSeen, lan, pubIp, inventory, inventoryAt, wakeOkAt, biosAttempt }));
   kvSet('sionyx:computers', list).catch((e) => console.error('[dash] kv computers:', e.message));
 }
 function loadHistFile() {

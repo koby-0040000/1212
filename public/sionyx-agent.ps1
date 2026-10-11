@@ -230,6 +230,7 @@ function Get-Stats {
 # ---- hardware inventory (on demand + once a day, in a background job like sysinfo/nettest) ----
 # Read-only: manufacturer, model, serial, BIOS, board, CPU, RAM modules, disks, GPU, OS and network adapters.
 function Get-Inventory {
+  try { [Threading.Thread]::CurrentThread.Priority = 'BelowNormal' } catch { }
   $inv = @{}
   $t0 = Get-Date
   try {
@@ -402,7 +403,26 @@ function Get-SysInfo {
         protected = [bool]($script:ProtectedProcs -contains $low -or [int]$_.IDProcess -le 4 -or [int]$_.IDProcess -eq $PID)
       }
     })
+    # many small instances of the same program (browser tabs, svchost) add up: group them by name
+    $out.groups = @($all | Group-Object { ($_.Name -replace '#\d+$', '').ToLower() } | ForEach-Object {
+      $cs = ($_.Group | Measure-Object -Property PercentProcessorTime -Sum).Sum
+      $ms = ($_.Group | Measure-Object -Property WorkingSet -Sum).Sum
+      @{ name = [string]$_.Name; count = [int]$_.Count; pct = [math]::Round([double]$cs / $threads, 1); memMb = [math]::Round([double]$ms / 1MB) }
+    } | Where-Object { $_.pct -gt 0 } | Sort-Object { $_.pct } -Descending | Select-Object -First 6)
   } catch { Log "Get-SysInfo: process query failed ($($_.Exception.Message)) - processes list will be empty" }
+  # where is the load coming from when no process explains it? drivers (DPC/interrupts), memory paging or a busy disk
+  try {
+    $pc = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop | Select-Object -First 1
+    $out.cpuBreak = @{ user = [int]$pc.PercentUserTime; priv = [int]$pc.PercentPrivilegedTime; dpc = [int]$pc.PercentDPCTime; intr = [int]$pc.PercentInterruptTime }
+  } catch { }
+  try {
+    $mm = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop | Select-Object -First 1
+    $out.mem = @{ availMb = [int]$mm.AvailableMBytes; pagesSec = [int]$mm.PagesPersec }
+  } catch { }
+  try {
+    $dk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'" -ErrorAction Stop | Select-Object -First 1
+    $out.disk = @{ pct = [int][math]::Min(100, [double]$dk.PercentDiskTime); queue = [double]$dk.CurrentDiskQueueLength }
+  } catch { }
   return $out
 }
 
@@ -538,7 +558,7 @@ function Poll-BgJobs {
       try { $val = @($j.Ps.EndInvoke($j.Handle)) | Select-Object -Last 1 } catch { Log "background job $name failed: $($_.Exception.Message)" }
       try { $j.Ps.Dispose() } catch { }
       $script:BgJobs.Remove($name)
-      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'inventory') { $script:Inventory = $val; $script:InvAt = Get-Date } elseif ($name -eq 'heal') { $script:Fail.Heals += [string]$val.text; $script:Fail.Local = $val.local; Log ('network self-heal result: ' + $val.text) } elseif ($name -eq 'diag') { $script:DiagResult = $val } elseif ($name -eq 'fix') { $script:FixResults += $val; Log ("fix result: " + $val.id + ' ok=' + $val.ok + ' ' + $val.msg) } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
+      if ($val) { if ($name -eq 'sysinfo') { $script:SysInfo = $val } elseif ($name -eq 'nettest') { $script:NetInfo = $val } elseif ($name -eq 'inventory') { $script:Inventory = $val; $script:InvAt = Get-Date } elseif ($name -eq 'heal') { $script:Fail.Heals += [string]$val.text; $script:Fail.Local = $val.local; Log ('network self-heal result: ' + $val.text) } elseif ($name -eq 'diag') { $script:DiagResult = $val } elseif ($name -eq 'fix') { $script:FixResults += $val; if ([string]$val.id -like 'enable_*wol') { $script:InvAt = $null }; Log ("fix result: " + $val.id + ' ok=' + $val.ok + ' ' + $val.msg) } elseif ($name -eq 'restartfilter') { Log "restartfilter result: $val"; $script:LogTail = ((Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue) -join "`n") } }
     } elseif (((Get-Date) - $j.At).TotalSeconds -gt $(if ($name -eq 'fix') { 300 } else { 100 })) {
       Log "background job $name timed out - abandoned (the heartbeat keeps running)"
       try { [void]$j.Ps.BeginStop($null, $null) } catch { }
@@ -714,6 +734,146 @@ function Get-Diagnosis {
   return @{ findings = @($f); checks = $checks; took = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) }
 }
 
+# Turns on the BIOS "Wake on LAN" setting through the maker's own WMI interface (Dell / Lenovo / HP only).
+# Touches that ONE setting, and only when it currently reads as disabled. Other makers do not expose BIOS settings to
+# Windows, so they get "not supported". A BIOS password makes the maker's call fail - the message says so.
+function Set-BiosWol {
+  $r = @{ ok = $false; msg = '' }
+  $mk = ''
+  try { $mk = [string](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer } catch { }
+  try {
+    if ($mk -match 'Dell') {
+      $x = @(Get-CimInstance -Namespace 'root\dcim\sysman' -ClassName DCIM_BIOSEnumeration -ErrorAction Stop | Where-Object { $_.AttributeName -match 'Wake.?on.?LAN' }) | Select-Object -First 1
+      if (-not $x) { $r.msg = 'Dell: no Wake-on-LAN setting exposed (Dell Command Monitor not installed?)'; return $r }
+      $cur = (@($x.CurrentValue) -join ',')
+      if ($cur -notmatch 'disab|^off$') { $r.ok = $true; $r.msg = 'Dell: already enabled (' + $cur + ')'; return $r }
+      $opts = @($x.PossibleValues)
+      $want = ($opts | Where-Object { $_ -match 'LAN Only' } | Select-Object -First 1)
+      if (-not $want) { $want = ($opts | Where-Object { $_ -notmatch 'disab|^off$' } | Select-Object -First 1) }
+      if (-not $want) { $r.msg = 'Dell: no enabled option available'; return $r }
+      $svc = Get-CimInstance -Namespace 'root\dcim\sysman' -ClassName DCIM_BIOSService -ErrorAction Stop | Select-Object -First 1
+      $o = Invoke-CimMethod -InputObject $svc -MethodName SetBIOSAttributes -Arguments @{ AttributeName = @([string]$x.AttributeName); AttributeValue = @([string]$want) } -ErrorAction Stop
+      $rv = [int]$o.ReturnValue
+      $r.ok = ($rv -eq 0)
+      $r.msg = if ($r.ok) { 'Dell: set ' + $x.AttributeName + ' ' + $cur + ' -> ' + $want + ' (may apply after restart)' } else { 'Dell: BIOS refused the change (code ' + $rv + ', BIOS password set?)' }
+    } elseif ($mk -match 'LENOVO') {
+      $x = @(Get-CimInstance -Namespace 'root\wmi' -ClassName Lenovo_BiosSetting -ErrorAction Stop | Where-Object { $_.CurrentSetting -match '^Wake.?on.?LAN' }) | Select-Object -First 1
+      if (-not $x) { $r.msg = 'Lenovo: no Wake-on-LAN setting exposed'; return $r }
+      $cs = [string]$x.CurrentSetting
+      $parts = $cs.Split(',;'.ToCharArray())
+      $name = [string]$parts[0]; $cur = [string]$parts[1]
+      if ($cur -notmatch 'disab') { $r.ok = $true; $r.msg = 'Lenovo: already enabled (' + $cur + ')'; return $r }
+      $opts = @()
+      if ($cs -match '\[Optional:([^\]]*)\]') { $opts = @($Matches[1].Split(',')) }
+      $want = $null
+      foreach ($pref in @('Automatic', 'Primary', 'ACandBattery', 'ACOnly', 'Enable', 'Enabled')) { if ($opts -contains $pref) { $want = $pref; break } }
+      if (-not $want) { $want = ($opts | Where-Object { $_ -notmatch 'disab' } | Select-Object -First 1) }
+      if (-not $want) { $r.msg = 'Lenovo: no enabled option available'; return $r }
+      $set = Get-CimInstance -Namespace 'root\wmi' -ClassName Lenovo_SetBiosSetting -ErrorAction Stop | Select-Object -First 1
+      $o = Invoke-CimMethod -InputObject $set -MethodName SetBiosSetting -Arguments @{ parameter = ($name + ',' + $want) } -ErrorAction Stop
+      if ([string]$o.return -ne 'Success') { $r.msg = 'Lenovo: BIOS refused the change (' + [string]$o.return + ', BIOS password set?)'; return $r }
+      $sv = Get-CimInstance -Namespace 'root\wmi' -ClassName Lenovo_SaveBiosSettings -ErrorAction Stop | Select-Object -First 1
+      $o2 = Invoke-CimMethod -InputObject $sv -MethodName SaveBiosSettings -Arguments @{ parameter = '' } -ErrorAction Stop
+      $r.ok = ([string]$o2.return -eq 'Success')
+      $r.msg = if ($r.ok) { 'Lenovo: set ' + $name + ' ' + $cur + ' -> ' + $want + ' (may apply after restart)' } else { 'Lenovo: change not saved (' + [string]$o2.return + ')' }
+    } elseif ($mk -match 'HP|Hewlett') {
+      $x = @(Get-CimInstance -Namespace 'root\HP\InstrumentedBIOS' -ClassName HP_BIOSEnumeration -ErrorAction Stop | Where-Object { $_.Name -match 'Wake.?on.?LAN|WOL' }) | Select-Object -First 1
+      if (-not $x) { $r.msg = 'HP: no Wake-on-LAN setting exposed'; return $r }
+      $cur = [string]$x.Value
+      if ($cur -notmatch 'disab') { $r.ok = $true; $r.msg = 'HP: already enabled (' + $cur + ')'; return $r }
+      $opts = @($x.PossibleValues)
+      $want = ($opts | Where-Object { $_ -match 'Boot to Network' } | Select-Object -First 1)
+      if (-not $want) { $want = ($opts | Where-Object { $_ -notmatch 'disab' } | Select-Object -First 1) }
+      if (-not $want) { $r.msg = 'HP: no enabled option available'; return $r }
+      $ifc = Get-CimInstance -Namespace 'root\HP\InstrumentedBIOS' -ClassName HP_BIOSSettingInterface -ErrorAction Stop | Select-Object -First 1
+      $o = Invoke-CimMethod -InputObject $ifc -MethodName SetBIOSSetting -Arguments @{ Name = [string]$x.Name; Value = [string]$want; Password = '<utf-16/>' } -ErrorAction Stop
+      $rv = [int]$o.Return
+      $r.ok = ($rv -eq 0)
+      $r.msg = if ($r.ok) { 'HP: set ' + $x.Name + ' ' + $cur + ' -> ' + $want + ' (may apply after restart)' } else { 'HP: BIOS refused the change (code ' + $rv + ', BIOS password set?)' }
+    } else {
+      $r.msg = 'not supported: ' + $mk + ' does not let Windows change BIOS settings - enable Wake on LAN in the BIOS screen'
+    }
+  } catch { $r.msg = 'error: ' + $_.Exception.Message }
+  return $r
+}
+
+# Eases a loaded computer WITHOUT ending anything: lowers the priority of the heaviest ordinary programs, caps the
+# Defender scan CPU when it is the heavy one, and trims memory only when RAM is nearly full. Never touches protected
+# system processes or the kiosk. Everything here is reversible (it resets on restart / when the program is reopened).
+function Relieve-Load {
+  $r = @{ ok = $false; msg = '' }
+  $acts = @()
+  $skip = '^(sionyx|kiosk)'
+  $defPct = 0
+  try {
+    $threads = [Math]::Max(1, [Environment]::ProcessorCount)
+    $perf = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction Stop | Where-Object { $_.Name -notin @('_Total', 'Idle') -and $_.PercentProcessorTime -gt 0 })
+    $groups = @($perf | Group-Object { ($_.Name -replace '#\d+$', '').ToLower() } | ForEach-Object {
+      @{ name = [string]$_.Name; pct = ([double](($_.Group | Measure-Object -Property PercentProcessorTime -Sum).Sum) / $threads) }
+    } | Sort-Object { $_.pct } -Descending | Select-Object -First 6)
+    $lowered = @()
+    foreach ($g in $groups) {
+      if ($g.name -eq 'msmpeng') { $defPct = $g.pct }
+      if ($g.pct -lt 2) { continue }
+      if ($script:ProtectedProcs -contains $g.name -or $g.name -match $skip) { continue }
+      $n = 0
+      foreach ($p in @(Get-Process -Name $g.name -ErrorAction SilentlyContinue)) {
+        try { if ($p.Id -ne $PID -and [string]$p.PriorityClass -ne 'BelowNormal' -and [string]$p.PriorityClass -ne 'Idle') { $p.PriorityClass = 'BelowNormal'; $n++ } } catch { }
+      }
+      if ($n -gt 0) { $lowered += $g.name }
+    }
+    if ($lowered.Count -gt 0) { $acts += ('lowered priority of ' + ($lowered -join ', ')) }
+  } catch { }
+  if ($defPct -ge 3) {
+    try {
+      $cur = [int](Get-MpPreference -ErrorAction Stop).ScanAvgCPULoadFactor
+      if ($cur -gt 30 -or $cur -eq 0) { Set-MpPreference -ScanAvgCPULoadFactor 20 -ErrorAction Stop; $acts += 'capped Defender scan CPU at 20%' }
+    } catch { }
+  }
+  try {
+    $mm = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop | Select-Object -First 1
+    $tot = [double](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1MB
+    if ($tot -gt 0 -and ([double]$mm.AvailableMBytes / $tot) -lt 0.15) {
+      try { Add-Type -Name 'SxMem' -Namespace 'Sx' -MemberDefinition '[System.Runtime.InteropServices.DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(System.IntPtr h);' -ErrorAction Stop } catch { }
+      $n = 0
+      foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        if ($p.Id -le 4 -or $p.Id -eq $PID) { continue }
+        $low = $p.ProcessName.ToLower()
+        if ($script:ProtectedProcs -contains $low -or $low -match $skip) { continue }
+        try { if ($p.WorkingSet64 -gt 50MB -and [Sx.SxMem]::EmptyWorkingSet($p.Handle)) { $n++ } } catch { }
+      }
+      if ($n -gt 0) { $acts += ('trimmed memory of ' + $n + ' programs (RAM was nearly full)') }
+    }
+  } catch { }
+  $r.ok = $true
+  $r.msg = if ($acts.Count -gt 0) { $acts -join '; ' } else { 'no change: the load is not caused by a program that can be limited safely (drivers, disk or hardware)' }
+  return $r
+}
+
+# Frees RAM on demand: shrinks the working set of every ordinary program above 20 MB (Windows moves the pages it can
+# spare to the standby list / disk and a program loads back what it really needs). Nothing is ended. Protected system
+# processes and the kiosk are skipped. Reports the available memory before and after.
+function Free-Memory {
+  $r = @{ ok = $false; msg = '' }
+  $skip = '^(sionyx|kiosk)'
+  try {
+    $before = [int](Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop | Select-Object -First 1).AvailableMBytes
+    try { Add-Type -Name 'SxMem' -Namespace 'Sx' -MemberDefinition '[System.Runtime.InteropServices.DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(System.IntPtr h);' -ErrorAction Stop } catch { }
+    $n = 0
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+      if ($p.Id -le 4 -or $p.Id -eq $PID) { continue }
+      $low = $p.ProcessName.ToLower()
+      if ($script:ProtectedProcs -contains $low -or $low -match $skip) { continue }
+      try { if ($p.WorkingSet64 -gt 20MB -and [Sx.SxMem]::EmptyWorkingSet($p.Handle)) { $n++ } } catch { }
+    }
+    Start-Sleep -Seconds 2
+    $after = [int](Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop | Select-Object -First 1).AvailableMBytes
+    $r.ok = $true
+    $r.msg = 'trimmed ' + $n + ' programs; available memory ' + $before + ' MB -> ' + $after + ' MB (' + ($after - $before) + ' MB)'
+  } catch { $r.msg = 'error: ' + $_.Exception.Message }
+  return $r
+}
+
 # The ONLY things the dashboard can ask the agent to repair. Each is a fixed, reversible-or-harmless action.
 function Invoke-Fix([string]$id) {
   $res = @{ id = $id; ok = $false; msg = ''; freedMb = 0 }
@@ -797,6 +957,18 @@ function Invoke-Fix([string]$id) {
         $res.ok = ($n -gt 0 -and $notes.Count -eq 0)
         $res.msg = if ($n -eq 0) { 'no active adapter' } elseif ($notes.Count -gt 0) { ($notes -join ' | ') } else { 'wake-on-magic-packet enabled on ' + $n + ' adapter(s) (also enable Wake on LAN in the BIOS)' }
       }
+      'free_memory' {
+        $b = @(Free-Memory) | Select-Object -Last 1
+        $res.ok = [bool]$b.ok; $res.msg = [string]$b.msg
+      }
+      'relieve_load' {
+        $b = @(Relieve-Load) | Select-Object -Last 1
+        $res.ok = [bool]$b.ok; $res.msg = [string]$b.msg
+      }
+      'enable_bios_wol' {
+        $b = @(Set-BiosWol) | Select-Object -Last 1
+        $res.ok = [bool]$b.ok; $res.msg = [string]$b.msg
+      }
       'reset_network_stack' {
         netsh winsock reset | Out-Null
         netsh int ip reset | Out-Null
@@ -812,7 +984,7 @@ function Invoke-Fix([string]$id) {
 $script:FixQueue = New-Object 'System.Collections.Generic.Queue[string]'
 $script:DiagResult = $null
 $script:FixResults = @()
-$script:FixIds = @('clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack', 'enable_wol')
+$script:FixIds = @('clean_temp', 'start_services', 'sync_time', 'flush_dns', 'repair_wmi', 'power_balanced', 'renew_ip', 'restart_adapter', 'enable_adapter', 'reset_network_stack', 'enable_wol', 'enable_bios_wol', 'relieve_load', 'free_memory')
 function Start-DiagJob {
   $k = $Key.Replace("'", "''"); $sv = $Server.Replace("'", "''")
   $prefix = "`$Server = '$sv'; `$Key = '$k'; `$Headers = @{ 'x-agent-key' = `$Key }"
@@ -823,7 +995,9 @@ function Start-NextFix {
   $id = $script:FixQueue.Dequeue()
   if ($script:FixIds -notcontains $id) { Log "fix refused (not in whitelist): $id"; return }
   Log "running fix: $id"
-  Start-BgJob 'fix' (Build-JobScript @('Get-TempDirs', 'Get-TempBytes', 'Invoke-Fix') '' "Invoke-Fix '$id'")
+  $plist = ($script:ProtectedProcs | ForEach-Object { "'" + $_ + "'" }) -join ','
+  $pfx = "`$script:ProtectedProcs = @($plist)"
+  Start-BgJob 'fix' (Build-JobScript @('Get-TempDirs', 'Get-TempBytes', 'Set-BiosWol', 'Relieve-Load', 'Free-Memory', 'Invoke-Fix') $pfx "Invoke-Fix '$id'")
 }
 
 # ---- network self-heal ----
@@ -1159,6 +1333,7 @@ $script:GoodFile = Join-Path $Dir 'agent.good.ps1'
 $script:PendingFile = Join-Path $Dir 'update.pending'
 $script:NoteFile = Join-Path $Dir 'update.note'
 $script:StartedAt = Get-Date
+try { (Get-Process -Id $PID).PriorityClass = 'BelowNormal' } catch { }
 $script:UpdateNote = ''
 $script:RejectedFp = ''
 

@@ -195,6 +195,7 @@
     <button class="f" data-f="off">לא מחוברים</button>
     <button class="f" data-f="hot">עומס גבוה</button>
     <button class="f" data-f="stale">לא מעודכנים</button>
+    <button class="f" id="biosAll" type="button" title="מנסה להפעיל Wake on LAN ב-BIOS במחשבי Dell / Lenovo / HP שה-BIOS שלהם מדווח כבוי">&#128295; הפעל WOL ב-BIOS</button>
     <button class="f" id="wolRep" type="button" title="איזה מחשבים מוכנים להדלקה מרחוק, ואיזה מהם כבוי ב-BIOS או ב-Windows">&#9211; מוכנות הדלקה</button>
     <button class="f" id="wakeAll" type="button" title="שלח Wake-on-LAN לכל המחשבים הכבויים שידועה להם כתובת רשת">&#9211; הדלק את כל הכבויים</button>
     <button class="f" id="selAll" title="סמן את כל המחשבים המחוברים (לפי הסינון)">&#9745; בחר מחוברים</button>
@@ -469,7 +470,7 @@ function renderSysInfo(c) {
     const h = hintFor(top);
     insight = `<div class="sysInsight">\u{1F50E} הגורם העיקרי לעומס: <b>${esc(baseName(top.name))}</b> (${top.pct}% מהמעבד)${h ? ' - ' + esc(h) : ''}.${top.protected ? ' זה תהליך מערכת, ולכן אי אפשר לסיים אותו מכאן.' : ' אם זה לא נחוץ אפשר ללחוץ "סיים".'}</div>`;
   } else if (si.cpuPct != null && si.cpuPct >= 60 && sum < 15) {
-    insight = '<div class="sysInsight">\u{1F50E} העומס הכולל גבוה אבל אף תהליך בודד לא מעמיס. ייתכן עומס רגעי, דרייבר או חומרה. כדאי לדגום שוב בעוד רגע.</div>';
+    insight = `<div class="sysInsight">\u{1F50E} העומס הכולל גבוה (${si.cpuPct}%) אבל אף תהליך בודד לא מעמיס. ${loadDiagnosis(si, st)}</div>`;
   } else {
     insight = '<div class="sysInsight ok">\u2705 אין תהליך שמעמיס על המעבד כרגע.</div>';
   }
@@ -494,13 +495,17 @@ function renderSysInfo(c) {
     </div>
     ${insight}
     <table class="sysTbl"><tr><th>תהליך</th><th>% מעבד</th><th>זיכרון</th><th></th></tr>${rows || '<tr><td colspan="4" style="color:var(--muted)">אין תהליכים שמעמיסים כרגע</td></tr>'}</table>
-    <div style="margin-top:12px"><button id="sysRefresh" class="small" type="button">\u{1F504} דגום שוב</button></div>
+    ${c.loadRelief ? `<div class="sysInsight ${c.loadRelief.ok ? 'ok' : ''}">\u26A1 <b>הקלת עומס</b> (${ago(c.loadRelief.at)}): ${esc(c.loadRelief.msg)}</div>` : ''}
+    ${c.memFree ? `<div class="sysInsight ${c.memFree.ok ? 'ok' : ''}">\u{1F9F9} <b>שחרור זיכרון</b> (${ago(c.memFree.at)}): ${esc(c.memFree.msg)}</div>` : ''}
+    <div style="margin-top:12px"><button id="sysRefresh" class="small" type="button">\u{1F504} דגום שוב</button> <button id="sysRelieve" class="small" type="button" title="מוריד עדיפות לתוכנות שמעמיסות, מגביל את סריקת Defender אם הוא הגורם, ומפנה זיכרון רק אם הוא כמעט מלא. לא מסיים שום תהליך.">\u26A1 הקל עומס</button> <button id="sysFree" class="small" type="button" title="מכווץ את הזיכרון הפעיל של כל התוכנות הרגילות כדי לפנות זיכרון. לא מסיים שום תהליך, ומציג כמה זיכרון פנוי היה לפני ואחרי.">\u{1F9F9} שחרר זיכרון</button></div>
     <div class="netBox" id="netBox"></div>
     <div class="netBox" id="histBox"></div>`;
   renderNetBox(c);
   loadHistory(c);
   body.querySelectorAll('button.kill').forEach((b) => { b.onclick = () => killProc(c, b); });
   const rf = $('sysRefresh'); if (rf) rf.onclick = () => openSysInfo(c, null);
+  const rl = $('sysRelieve'); if (rl) rl.onclick = () => relieveLoad(c, rl);
+  const fr = $('sysFree'); if (fr) fr.onclick = () => freeMemory(c, fr);
 }
 
 // ---- network check ----
@@ -716,6 +721,39 @@ async function forget(c) {
   refresh();
 }
 
+// ---------- load diagnosis + relief ----------
+function loadDiagnosis(si, st) {
+  const b = si.cpuBreak || {}, m = si.mem || {}, d = si.disk || {};
+  const g = (si.groups || [])[0];
+  const kern = (b.dpc || 0) + (b.intr || 0);
+  const memLow = m.availMb != null && st && st.ramTotalGb && (m.availMb / 1024) / st.ramTotalGb < 0.12;
+  if (g && g.count > 1 && g.pct >= 10) return `הסיבה: <b>${esc(baseName(g.name))}</b> - ${g.count} מופעים ביחד מעמיסים ${g.pct}% מהמעבד, כל אחד לבד קטן${hintFor(g) ? ' (' + esc(hintFor(g)) + ')' : ''}. "הקל עומס" מוריד להם עדיפות.`;
+  if (kern >= 10) return `הסיבה: דרייברים והתקנים - DPC ${b.dpc}% ופסיקות ${b.intr}% מהמעבד. בדרך כלל דרייבר פגום של כרטיס רשת, שמע או USB, או התקן חיצוני תקול. זה לא ניתן לתיקון מרחוק: עדכון דרייבר או ניתוק התקנים בדרך כלל פותר.`;
+  if (memLow || (m.pagesSec || 0) >= 500) return `הסיבה: מחסור בזיכרון - פנוי ${m.availMb != null ? m.availMb + ' MB' : 'מעט'}${m.pagesSec ? ', ' + m.pagesSec + ' החלפות לדיסק בשנייה' : ''}. המחשב מחליף זיכרון לדיסק ומאט. "הקל עומס" מפנה זיכרון; הפתרון הקבוע הוא להוסיף זיכרון.`;
+  if ((d.pct || 0) >= 85) return `הסיבה: הדיסק עמוס ב-${d.pct}% (תור ${d.queue ?? '-'}). המעבד מחכה לדיסק. דיסק איטי או כושל, או עדכון/סריקה ברקע.`;
+  if ((b.priv || 0) >= 50) return `הסיבה: עומס בליבת המערכת (${b.priv}% במצב ליבה) - לרוב דרייבר או שירות מערכת.`;
+  return 'ייתכן עומס רגעי. כדאי לדגום שוב בעוד רגע.';
+}
+async function relieveLoad(c, btn) {
+  if (!confirm(`להקל את העומס במחשב ${c.number}?\n\nלא מסיים שום תהליך. מוריד עדיפות לתוכנות שמעמיסות, מגביל את סריקת Defender אם הוא הגורם, ומפנה זיכרון רק אם הוא כמעט מלא. הכול חוזר לברירת מחדל באתחול או כשהתוכנה נפתחת מחדש.`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/computers/${encodeURIComponent(c.number)}/fix`, { method: 'POST', body: { ids: ['relieve_load'] } });
+    toast('הבקשה נשלחה. התוצאה תופיע כאן וב"אירועים". לחץ "דגום שוב" בעוד חצי דקה לראות את העומס.', 'ok');
+  } catch (e) { toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err'); }
+  setTimeout(() => { if (btn) btn.disabled = false; }, 5000);
+}
+
+async function freeMemory(c, btn) {
+  if (!confirm(`לשחרר זיכרון במחשב ${c.number}?\n\nלא מסיים שום תהליך. מכווץ את הזיכרון הפעיל של התוכנות הרגילות, וייתכן האטה קלה רגעית כשהן טוענות בחזרה את מה שהן צריכות. תוכנות מערכת מוגנות והקיוסק לא נוגעים.`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/computers/${encodeURIComponent(c.number)}/fix`, { method: 'POST', body: { ids: ['free_memory'] } });
+    toast('הבקשה נשלחה. התוצאה (זיכרון פנוי לפני ואחרי) תופיע כאן וב"אירועים" תוך כחצי דקה.', 'ok');
+  } catch (e) { toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err'); }
+  setTimeout(() => { if (btn) btn.disabled = false; }, 5000);
+}
+
 // ---------- Wake-on-LAN readiness ----------
 // Windows cannot read the BIOS setting in general: it is read from the vendor's WMI where available (Dell / Lenovo / HP).
 // Otherwise the BIOS state is "unknown" and the only proof is a real wake: a computer that came back after a
@@ -750,7 +788,7 @@ function openWolReport() {
     .sort((a, b) => ORDER[a.w.cls] - ORDER[b.w.cls] || a.c.number.localeCompare(b.c.number, undefined, { numeric: true }));
   const cnt = (k) => rows.filter((r) => r.w.cls === k).length;
   const ICON = { ok: '\u2705', warn: '\u26A0\uFE0F', bad: '\u274C', unk: '\u2754' };
-  const tr = rows.map(({ c, w }) => `<tr><td><b>${esc(c.number)}</b>${c.name ? `<span class="procHint">${esc(c.name)}</span>` : ''}</td><td>${c.online ? 'דלוק' : 'כבוי'}</td><td>${ICON[w.cls]} ${esc(w.text)}</td><td>${esc(w.win)}</td><td>${esc(w.bios)}</td></tr>`).join('');
+  const tr = rows.map(({ c, w }) => `<tr><td><b>${esc(c.number)}</b>${c.name ? `<span class="procHint">${esc(c.name)}</span>` : ''}</td><td>${c.online ? 'דלוק' : 'כבוי'}</td><td>${ICON[w.cls]} ${esc(w.text)}</td><td>${esc(w.win)}</td><td>${esc(w.bios)}${c.biosAttempt ? `<span class="procHint">${c.biosAttempt.ok ? '\u2714' : '\u2718'} ניסיון הפעלה: ${esc(c.biosAttempt.msg)}</span>` : ''}</td></tr>`).join('');
   $('sysBody').innerHTML = `<div class="sysInsight ${cnt('ok') === rows.length && rows.length ? 'ok' : ''}">${ICON.ok} ${cnt('ok')} מוכנים · ${ICON.warn} ${cnt('warn')} דורשים בדיקה · ${ICON.bad} ${cnt('bad')} לא יעבדו · ${ICON.unk} ${cnt('unk')} לא ידוע</div>
     <table class="sysTbl"><tr><th>מחשב</th><th>מצב</th><th>הדלקה מרחוק</th><th>Windows</th><th>BIOS</th></tr>${tr || '<tr><td colspan="5" style="color:var(--muted)">אין מחשבים</td></tr>'}</table>
     <div class="sysSub2" style="margin-top:12px;line-height:1.6">ה-BIOS נקרא ישירות רק במחשבי Dell, Lenovo ו-HP. בשאר, כשכתוב "לא ניתן לזיהוי", ההוכחה היחידה היא הדלקה בפועל: מחשב שנדלק אחרי בקשת הדלקה מסומן "אומת". "כבוי ב-Windows" אפשר להפעיל מרחוק מחלון "מפרט חומרה" של המחשב. כבוי ב-BIOS צריך להפעיל ידנית במחשב עצמו.</div>`;
@@ -780,10 +818,11 @@ function renderInventory(c) {
   const body = $('sysBody');
   const lan = (c.lan || []).map((x) => `${esc(x.mac)} (${esc(x.ip)}${x.wifi ? ', Wi-Fi' : ''})`).join('<br>');
   const wakeBtn = !c.online && c.canWake ? '<button id="invWake" class="small primary" type="button">\u23FB הדלק מחשב</button> ' : '';
-  const refBtn = c.online ? '<button id="invRefresh" class="small" type="button">\u{1F504} רענן מהמחשב</button> <button id="invWol" class="small" type="button" title="מפעיל wake on magic packet בכרטיס הרשת של המחשב (צריך גם להפעיל Wake on LAN ב-BIOS)">\u26A1 הפעל Wake-on-LAN בכרטיס הרשת</button>' : '';
+  const refBtn = c.online ? '<button id="invRefresh" class="small" type="button">\u{1F504} רענן מהמחשב</button> <button id="invBios" class="small" type="button" title="מנסה לשנות את הגדרת Wake on LAN ב-BIOS דרך הממשק של היצרן (Dell / Lenovo / HP בלבד)">\u{1F527} נסה להפעיל ב-BIOS</button> <button id="invWol" class="small" type="button" title="מפעיל wake on magic packet בכרטיס הרשת של המחשב (צריך גם להפעיל Wake on LAN ב-BIOS)">\u26A1 הפעל Wake-on-LAN בכרטיס הרשת</button>' : '';
   const head = `<div class="sysSub2">${v ? 'נאסף ' + ago(c.inventoryAt) : 'עדיין לא נאסף מפרט ממחשב זה.'}${c.online ? '' : ' · המחשב לא מחובר - מוצג המידע השמור'}</div>
     <div class="netHead"><span>כתובות רשת (MAC / IP)</span></div>${lan ? `<div class="sysSub2" style="direction:ltr;text-align:right">${lan}</div>` : '<div class="sysSub2">לא ידועה כתובת רשת. היא נקלטת כשהסוכן המעודכן מתחבר.</div>'}
     <div class="sysInsight ${wolInfo(c).cls === 'ok' ? 'ok' : ''}">\u23FB <b>הדלקה מרחוק: ${esc(wolInfo(c).text)}</b><br>Windows: ${esc(wolInfo(c).win)} · BIOS: ${esc(wolInfo(c).bios)}</div>
+    ${c.biosAttempt ? `<div class="sysInsight ${c.biosAttempt.ok ? 'ok' : ''}">\u{1F527} <b>ניסיון הפעלה ב-BIOS ${c.biosAttempt.ok ? 'הצליח' : 'לא הצליח'}</b> (${ago(c.biosAttempt.at)})<br>${esc(c.biosAttempt.msg)}</div>` : ''}
     <div style="margin:0 0 12px">${wakeBtn}${refBtn}</div>`;
   if (!v) {
     body.innerHTML = head + (c.online ? '<div class="sysLoading">הסוכן אוסף את המפרט אוטומטית תוך כדקה מהעדכון, או לחץ \"רענן מהמחשב\".</div>' : '<div class="sysLoading">אין עדיין נתונים. הם יישמרו כשהמחשב יתחבר בגרסת הסוכן החדשה.</div>');
@@ -810,6 +849,7 @@ function renderInventory(c) {
   const w = $('invWake'); if (w) w.onclick = () => wakeComputer(c, w);
   const rf = $('invRefresh'); if (rf) rf.onclick = () => requestInventory(c, rf);
   const wl = $('invWol'); if (wl) wl.onclick = () => enableWol(c, wl);
+  const bi = $('invBios'); if (bi) bi.onclick = () => enableBiosWol(c, bi);
 }
 
 async function requestInventory(c, btn) {
@@ -839,6 +879,24 @@ async function enableWol(c, btn) {
   } catch (e) { toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err'); }
   if (btn) btn.disabled = false;
 }
+
+async function enableBiosWol(c, btn, quiet) {
+  if (!quiet && !confirm(`לנסות להפעיל Wake on LAN ב-BIOS של מחשב ${c.number}?\n\nזה משנה הגדרה אחת בלבד, ורק אם היא כבויה, דרך הממשק של היצרן. עובד במחשבי Dell, Lenovo ו-HP. בשאר היצרנים (כמו ASUS) תתקבל הודעה "לא נתמך". אם מוגדרת סיסמת BIOS השינוי יידחה. ייתכן שיידרש אתחול כדי שייכנס לתוקף.`)) return false;
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/computers/${encodeURIComponent(c.number)}/fix`, { method: 'POST', body: { ids: ['enable_bios_wol'] } });
+    if (!quiet) toast('הבקשה נשלחה. התוצאה תופיע כאן וב"אירועים" תוך כחצי דקה.', 'ok');
+    if (btn) setTimeout(() => { btn.disabled = false; }, 4000);
+    return true;
+  } catch (e) { if (!quiet) toast(e.message === 'agent_outdated' ? OUTDATED_MSG : e.status === 409 ? 'המחשב כבוי או לא מגיב' : 'שגיאה: ' + e.message, 'err'); if (btn) btn.disabled = false; return false; }
+}
+$('biosAll').onclick = async () => {
+  const targets = data.filter((c) => c.online && c.inventory && c.inventory.biosWol && c.inventory.biosWol.state === 'disabled');
+  if (!targets.length) { toast('לא נמצאו מחשבים דלוקים שה-BIOS שלהם מדווח "כבוי" (נקרא רק ב-Dell / Lenovo / HP).', 'err'); return; }
+  if (!confirm(`לנסות להפעיל Wake on LAN ב-BIOS של ${targets.length} מחשבים?\n${targets.map((c) => c.number).join(', ')}\n\nזה משנה הגדרה אחת בלבד. התוצאה לכל מחשב תופיע ב"אירועים" ובחלון "מוכנות הדלקה".`)) return;
+  let ok = 0; for (const c of targets) { if (await enableBiosWol(c, null, true)) ok++; }
+  toast(`נשלחה בקשה ל-${ok} מחשבים. התוצאות יופיעו תוך כחצי דקה.`, 'ok');
+};
 
 const WAKE_ERR = {
   no_mac: 'עדיין לא ידועה כתובת הרשת (MAC) של המחשב. היא נקלטת כשהסוכן המעודכן מתחבר לפחות פעם אחת.',
